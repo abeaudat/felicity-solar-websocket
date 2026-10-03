@@ -4,7 +4,7 @@ Home Assistant custom integration for Felicity Solar / FSolar, forked from
 [Smilebob Edition](https://github.com/smilebob/felicity_solar_hacs), itself based
 on [Matheus Trindade's integration](https://github.com/matheustavarestrindade/felicity_solar_hacs).
 
-Version **2.0.1** replaces HTTP telemetry snapshots with the same WebSocket read
+Version **2.0.2** replaces HTTP telemetry snapshots with the same WebSocket read
 protocol used by the FSolar web portal's **Real-time Data** button. The default
 read interval is **5 seconds**, adjustable between 2 and 60 seconds.
 
@@ -23,7 +23,12 @@ read interval is **5 seconds**, adjustable between 2 and 60 seconds.
   presented as available telemetry.
 - Cancels listeners and closes its owned session when the integration unloads.
 
-**There is no HTTP telemetry fallback and no `/device/get_device_snapshot` call.**
+Inverter telemetry always uses WebSocket. An optional **Use HTTP every 5 minutes
+for separate battery packs** setting is disabled by default. Enable it when a
+separate battery does not support its own WebSocket: only discovered battery
+packs use `/device/get_device_snapshot`, every 300 seconds. There is no inverter
+HTTP fallback. Battery request failures mark the battery unavailable; task
+cancellation stops polling on unload.
 HTTPS remains necessary for authentication, discovery, device metadata, alarms,
 existing remote-setting functions, and explicitly requested historical queries.
 This remains a **cloud** integration and needs Internet access.
@@ -88,8 +93,9 @@ The production WebSocket client was also tested against an IVGM15KLP3G1 on
 a short telemetry test, not a continuous-operation or physical-control test.
 The separate battery protocol is covered by fixtures. The FLA48300TG2 tested
 on this installation did not answer its own energy-flow WebSocket, including
-when tested without the inverter connection; its BMS entities therefore remain
-unavailable in WebSocket-only mode. Missing lifetime energy counters are reported
+when tested without the inverter connection; enable the optional battery HTTP
+setting to retain its BMS readings. Its entities remain unavailable in
+WebSocket-only mode. Missing lifetime energy counters are reported
 as unknown rather than zero. Hardware compatibility with every battery/logger
 is not claimed.
 

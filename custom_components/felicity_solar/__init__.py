@@ -3,7 +3,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 
-from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL
+from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL, CONF_BATTERY_HTTP
 from .coordinator import FelicitySolarCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=password,
         update_interval=update_interval,
         config_entry=entry,
+        battery_http_polling=bool(entry.options.get(CONF_BATTERY_HTTP, False)),
     )
 
     async def async_stop_streams(_event):
@@ -183,6 +184,10 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update coordinator update interval when options change."""
     coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if coordinator and isinstance(coordinator, FelicitySolarCoordinator):
+        battery_http = bool(entry.options.get(CONF_BATTERY_HTTP, False))
+        if coordinator.battery_http_polling != battery_http:
+            await hass.config_entries.async_reload(entry.entry_id)
+            return
         new_interval = int(entry.options.get(CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL))
         coordinator.set_realtime_interval(new_interval)
         _LOGGER.info("Felicity Solar WebSocket interval changed to %d seconds", new_interval)

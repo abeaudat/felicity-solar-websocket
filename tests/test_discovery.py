@@ -47,3 +47,29 @@ async def test_discovery_failure_does_not_replace_known_devices():
         with pytest.raises(ValueError, match='discovery failed'):
             await api._load_devices_serial_numbers()
         assert 'existing' in api.devices
+
+
+async def test_opt_in_battery_snapshot_request_and_serial_isolation():
+    expected_sn = 'battery'
+    returned_sn = 'battery'
+    requests = []
+    async def handler(request):
+        body = await request.json()
+        assert request.headers['authorization'] == 'test-token'
+        requests.append(body)
+        return web.json_response({'code': 200, 'data': {
+            'deviceSn': returned_sn, 'battSoc': 80, 'ratedEnergy': 15,
+        }})
+    async with server(handler, method='POST') as url, aiohttp.ClientSession() as session:
+        api = FelicitySolarAPI('account@example.invalid', 'unused', session)
+        api.API_URL_BATTERY_SNAPSHOT = url
+        api.bearer_token = 'test-token'
+        api.token_expiration = datetime.now() + timedelta(hours=1)
+        api.devices = {expected_sn: {'deviceType': 'BP'}}
+        result = await api.get_battery_snapshot(expected_sn)
+        assert result['battSoc'] == 80
+        assert requests[0]['deviceSn'] == expected_sn
+        assert requests[0]['deviceType'] == 'BP'
+        returned_sn = 'different-battery'
+        with pytest.raises(ValueError, match='mismatch'):
+            await api.get_battery_snapshot(expected_sn)

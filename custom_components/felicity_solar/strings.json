@@ -31,9 +31,10 @@
     "step": {
       "init": {
         "title": "Felicity Solar WebSocket",
-        "description": "Configure the WebSocket read interval. Telemetry is never fetched over HTTP.",
+        "description": "Configure inverter WebSocket reads. Optionally read separate battery packs over HTTP every 5 minutes when their WebSocket is unsupported.",
         "data": {
-          "realtime_interval": "WebSocket interval (seconds)"
+          "realtime_interval": "WebSocket interval (seconds)",
+          "battery_http_polling": "Use HTTP every 5 minutes for separate battery packs"
         }
       }
     }

@@ -36,6 +36,7 @@ class FelicitySolarAPI:
     API_URL_DEVICE_LIST = "https://shine-api.felicitysolar.com/device/list_device_all_type"
     API_URL_USER_LOGIN = "https://shine-api.felicitysolar.com/userlogin"
     API_URL_REFRESH_TOKEN = "https://shine-api.felicitysolar.com/openApi/sec/refreshToken"
+    API_URL_BATTERY_SNAPSHOT = "https://shine-api.felicitysolar.com/device/get_device_snapshot"
     API_URL_DEVICE_BASIC = "https://shine-api.felicitysolar.com/openApi/data/deviceDataBasic/"
     API_URL_DEVICE_WARN = "https://shine-api.felicitysolar.com/openApi/data/deviceDataWarn/"
     API_URL_DEVICE_SETTING = "https://shine-api.felicitysolar.com/openApi/cmd/deviceSetting"
@@ -104,6 +105,34 @@ class FelicitySolarAPI:
                 "WebSocket telemetry remains separate; remote controls and OpenAPI endpoints are disabled.",
                 self.email,
             )
+
+    async def get_battery_snapshot(self, device_sn: str) -> dict:
+        """Read only a discovered separate battery; never poll inverter telemetry."""
+        device = self.devices.get(device_sn, {})
+        kind = str(device.get("productTypeEnum") or device.get("deviceType", ""))
+        if kind != "BP" and "BATTERY" not in kind.upper():
+            raise ValueError("HTTP telemetry is restricted to discovered battery packs")
+        await self._ensure_authenticated()
+        for attempt in range(2):
+            async with self.session.post(
+                self.API_URL_BATTERY_SNAPSHOT,
+                headers={"Authorization": self.bearer_token, "Accept": "application/json"},
+                json={"deviceSn": device_sn, "deviceType": "BP",
+                      "dateStr": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+            code = result.get("code")
+            if code in (998, 999) and attempt == 0:
+                await self._login()
+                continue
+            snapshot = result.get("data")
+            if code not in (0, 200) or not isinstance(snapshot, dict) or not snapshot:
+                raise ValueError("Battery snapshot request failed")
+            if snapshot.get("deviceSn", device_sn) != device_sn:
+                raise ValueError("Battery snapshot serial number mismatch")
+            return snapshot
+        raise ValueError("Battery snapshot authentication failed")
 
     async def get_device_basic_info(self, device_sn: str) -> dict:
         """Fetch basic device info (firmware version, collector SN, status) from OpenAPI."""

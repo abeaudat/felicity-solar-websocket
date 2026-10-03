@@ -185,3 +185,76 @@ async def test_initial_refresh_discovers_device_and_starts_real_stream(coordinat
         await coordinator.async_close()
         assert coordinator._session.closed
         assert all(task.done() for task in tasks)
+
+
+async def test_opt_in_battery_http_does_not_poll_inverter_and_stops(coordinator, monkeypatch):
+    import asyncio
+    from custom_components.felicity_solar import coordinator as module
+    from types import SimpleNamespace
+
+    coordinator.battery_http_polling = True
+    coordinator._metadata.clear()
+    coordinator.api.devices = {
+        'battery': {'deviceSn': 'battery', 'deviceType': 'BP'},
+        'inverter': {'deviceSn': 'inverter', 'deviceType': 'INV', 'collectorSn': 'logger'},
+    }
+    coordinator.api.initialize = AsyncMock()
+    coordinator.api.get_device_basic_info = AsyncMock(return_value={})
+    coordinator.api.get_device_warnings = AsyncMock(return_value=[])
+    coordinator.api.get_device_settings = AsyncMock(return_value={})
+    coordinator.api.get_battery_snapshot = AsyncMock(return_value={
+        'deviceSn': 'battery', 'battSoc': 80, 'ratedEnergy': 15,
+        'battVolt': 53, 'bmsPower': -950,
+    })
+    monkeypatch.setattr(module, 'BATTERY_HTTP_INTERVAL', 0.03)
+    ready = asyncio.Event()
+    ready.set()
+    class Reader:
+        first_frame = ready
+        def __init__(self, *args, **kwargs):
+            self.args = args
+        def start(self):
+            self.args[3](frame())
+        async def stop(self):
+            pass
+    monkeypatch.setattr(module, 'FelicityRealtimeClient', Reader)
+    await coordinator.async_config_entry_first_refresh()
+    assert set(coordinator._clients) == {'inverter'}
+    assert set(coordinator._battery_tasks) == {'battery'}
+    assert coordinator.data['battery']['data']['soc'] == 80
+    assert coordinator.data['battery']['data']['power'] == -950
+    assert coordinator.data['inverter']['data']['pvPower'] == 560
+    coordinator.api.get_battery_snapshot.assert_awaited_once_with('battery')
+    await asyncio.sleep(0.045)
+    assert coordinator.api.get_battery_snapshot.await_count == 2
+    coordinator.api.get_battery_snapshot.side_effect = RuntimeError('test failure')
+    await coordinator._poll_battery_once('battery')
+    assert not coordinator.data['battery']['realtime_available']
+    assert coordinator.data['inverter']['realtime_available']
+    tasks = list(coordinator._battery_tasks.values())
+    await coordinator.async_close()
+    count = coordinator.api.get_battery_snapshot.await_count
+    await asyncio.sleep(0.045)
+    assert coordinator.api.get_battery_snapshot.await_count == count
+    assert all(task.done() for task in tasks)
+
+
+async def test_battery_http_api_rejects_inverters_before_network(coordinator):
+    coordinator.api.devices = {'inverter': {'deviceType': 'INV'}}
+    coordinator.api._ensure_authenticated = AsyncMock()
+    with pytest.raises(ValueError, match='restricted'):
+        await coordinator.api.get_battery_snapshot('inverter')
+    with pytest.raises(ValueError, match='restricted'):
+        await coordinator.api.get_battery_snapshot('unknown')
+    coordinator.api._ensure_authenticated.assert_not_awaited()
+
+
+async def test_options_form_defaults_to_websocket_only(coordinator):
+    from types import SimpleNamespace
+    flow = FelicitySolarOptionsFlowHandler()
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace(
+        async_get_known_entry=lambda _: coordinator.config_entry))
+    flow.handler = coordinator.config_entry.entry_id
+    result = await flow.async_step_init()
+    validated = result['data_schema']({})
+    assert validated == {'realtime_interval': 5, 'battery_http_polling': False}

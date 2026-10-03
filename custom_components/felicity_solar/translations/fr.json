@@ -31,9 +31,10 @@
     "step": {
       "init": {
         "title": "Felicity Solar WebSocket",
-        "description": "Configurez la cadence des lectures WebSocket. Les mesures ne sont jamais lues par HTTP.",
+        "description": "Configurez le flux WebSocket de l’onduleur. Si nécessaire, activez une lecture HTTP toutes les 5 minutes pour les batteries séparées sans WebSocket.",
         "data": {
-          "realtime_interval": "Intervalle WebSocket (secondes)"
+          "realtime_interval": "Intervalle WebSocket (secondes)",
+          "battery_http_polling": "Lire les batteries séparées par HTTP toutes les 5 minutes"
         }
       }
     }

@@ -8,7 +8,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.core import HomeAssistant
 
 from .api import FelicitySolarAPI, DeviceTypeEnum, create_felicity_client_session
-from .const import DOMAIN, DEFAULT_REALTIME_INTERVAL
+from .const import DOMAIN, DEFAULT_REALTIME_INTERVAL, BATTERY_HTTP_INTERVAL
 from .realtime import FelicityRealtimeClient, normalize_snapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -214,11 +214,11 @@ WORK_MODE_MAP = {
 
 
 class FelicitySolarCoordinator(DataUpdateCoordinator):
-    """Push telemetry to existing entities; HTTP handles account metadata only."""
+    """Push inverter telemetry, with explicitly enabled slow battery reads."""
 
     def __init__(self, hass: HomeAssistant, email: str, password: str,
                  update_interval: int = DEFAULT_REALTIME_INTERVAL, *,
-                 config_entry: ConfigEntry | None = None):
+                 config_entry: ConfigEntry | None = None, battery_http_polling: bool = False):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=None,
                          config_entry=config_entry)
         self._session = create_felicity_client_session(hass)
@@ -229,6 +229,8 @@ class FelicitySolarCoordinator(DataUpdateCoordinator):
         self._snapshots: dict[str, dict] = {}
         self._power_scales: dict[str, float] = {}
         self._entries: dict[str, dict] = {}
+        self.battery_http_polling = battery_http_polling
+        self._battery_tasks: dict[str, asyncio.Task] = {}
         self._initialized = False
         self._closed = False
         self.realtime_interval = update_interval
@@ -262,7 +264,7 @@ class FelicitySolarCoordinator(DataUpdateCoordinator):
         self._publish()
 
     async def _async_update_data(self) -> dict[str, dict]:
-        """Set up streams or refresh settings; never retrieve HTTP telemetry."""
+        """Set up telemetry transports or refresh settings metadata."""
         try:
             if not self._initialized:
                 await self.api.initialize()
@@ -286,6 +288,11 @@ class FelicitySolarCoordinator(DataUpdateCoordinator):
                         "firmwareVersion": meta.get("firmwareVersion"),
                         "settings": meta["settings"], "data": {}, "realtime_available": False,
                     }
+                    if is_battery and self.battery_http_polling:
+                        await self._poll_battery_once(device_sn)
+                        self._battery_tasks[device_sn] = asyncio.create_task(
+                            self._battery_poll_loop(device_sn), name=f"felicity-battery-{device_sn}")
+                        continue
                     collector_sn = meta.get("collectorSn2") or meta.get("collectorSn")
                     if not collector_sn:
                         _LOGGER.warning("Device %s has no collector SN; realtime unavailable", device_sn)
@@ -324,9 +331,35 @@ class FelicitySolarCoordinator(DataUpdateCoordinator):
         except Exception as err:
             raise UpdateFailed("Error setting up FSolar realtime telemetry") from err
 
+    async def _poll_battery_once(self, device_sn: str) -> None:
+        try:
+            snapshot = await self.api.get_battery_snapshot(device_sn)
+            if self._closed:
+                return
+            meta = self._metadata[device_sn]
+            snapshot = {**snapshot, "productTypeEnum": DeviceTypeEnum.LITHIUM_BATTERY_PACK}
+            self._snapshots[device_sn] = snapshot
+            self._entries[device_sn] = {
+                **self._map_snapshot(device_sn, snapshot, meta, meta["warnings"], {}),
+                "realtime_available": True,
+            }
+            self._publish()
+        except Exception as err:
+            _LOGGER.warning("Battery HTTP telemetry failed for %s (%s)", device_sn, type(err).__name__)
+            self._on_status(device_sn, False)
+
+    async def _battery_poll_loop(self, device_sn: str) -> None:
+        while not self._closed:
+            await asyncio.sleep(BATTERY_HTTP_INTERVAL)
+            await self._poll_battery_once(device_sn)
+
     async def async_close(self) -> None:
         """Cancel all listeners before closing the owned session."""
         self._closed = True
+        for task in self._battery_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self._battery_tasks.values(), return_exceptions=True)
+        self._battery_tasks.clear()
         await asyncio.gather(*(client.stop() for client in self._clients.values()))
         self._clients.clear()
         await self._session.close()
