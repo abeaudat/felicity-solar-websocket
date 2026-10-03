@@ -88,16 +88,49 @@ python3.14 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-The production WebSocket client was also tested against an IVGM15KLP3G1 on
-2026-10-03 with TLS verification enabled and a 5-second read interval. This was
-a short telemetry test, not a continuous-operation or physical-control test.
-The separate battery protocol is covered by fixtures. The FLA48300TG2 tested
-on this installation did not answer its own energy-flow WebSocket, including
-when tested without the inverter connection; the default battery HTTP
-reads retain its BMS readings. Its entities remain unavailable in
-WebSocket-only mode. Missing lifetime energy counters are reported
-as unknown rather than zero. Hardware compatibility with every battery/logger
-is not claimed.
+### Tested hardware and versions
+
+The following installation was tested on **2026-10-03**, running integration
+**2.0.3** on **Home Assistant 2026.9.4**. The 26 automated tests also pass against
+the real Home Assistant 2026.9.4 framework on Python 3.14.
+
+| Device | Model | Rating reported by FSolar | Telemetry verified in Home Assistant |
+| --- | --- | --- | --- |
+| Inverter | Felicity Solar **IVGM15KLP3G1** | 15 kW | WebSocket reads at approximately 5-second intervals, with TLS verification enabled |
+| Separate battery pack | Felicity Solar **FLA48300TG2** | 300 Ah; 15 kWh reported by the battery API | Authenticated HTTP snapshots at approximately 5-minute intervals, including BMS SOC and remaining energy |
+
+Version values below were read directly from the **Shine / FSolar device detail
+pages** on the same date. Field names match the portal's labels; hardware and
+firmware versions are listed separately.
+
+**IVGM15KLP3G1 inverter**
+
+| FSolar version field | Tested value |
+| --- | --- |
+| Master Version | `128` |
+| Slave Version | `123` |
+| Comm Version | `308.06.005` |
+| Hardware Version | `261` |
+| Firmware Version | `100` |
+
+**FLA48300TG2 battery pack**
+
+| FSolar version field | Tested value |
+| --- | --- |
+| Master Version | `524` |
+| IAP Version | `8` |
+| Sub Version | `0` |
+
+The battery did not answer its own energy-flow WebSocket, including when tested
+without the inverter connection. The default HTTP battery reads restore its BMS
+entities and battery-based dashboard estimates; these entities remain unavailable
+in WebSocket-only mode. The inverter continues to use WebSocket independently.
+
+These were live telemetry and dashboard checks, not a long-term endurance test
+or a physical-control test. Missing lifetime energy counters are reported as
+unknown rather than zero. This records one verified hardware/firmware combination;
+compatibility with other models, versions or loggers is not established by these
+tests.
 
 ## Credits and license
 
