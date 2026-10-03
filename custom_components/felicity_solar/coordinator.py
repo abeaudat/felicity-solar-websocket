@@ -8,7 +8,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.core import HomeAssistant
 
 from .api import FelicitySolarAPI, DeviceTypeEnum, create_felicity_client_session
-from .const import DOMAIN, DEFAULT_REALTIME_INTERVAL, BATTERY_HTTP_INTERVAL
+from .const import DOMAIN, DEFAULT_REALTIME_INTERVAL, BATTERY_HTTP_INTERVAL, DEFAULT_BATTERY_HTTP
 from .realtime import FelicityRealtimeClient, normalize_snapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -218,7 +218,7 @@ class FelicitySolarCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass: HomeAssistant, email: str, password: str,
                  update_interval: int = DEFAULT_REALTIME_INTERVAL, *,
-                 config_entry: ConfigEntry | None = None, battery_http_polling: bool = False):
+                 config_entry: ConfigEntry | None = None, battery_http_polling: bool = DEFAULT_BATTERY_HTTP):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=None,
                          config_entry=config_entry)
         self._session = create_felicity_client_session(hass)

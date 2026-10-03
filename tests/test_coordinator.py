@@ -192,7 +192,7 @@ async def test_opt_in_battery_http_does_not_poll_inverter_and_stops(coordinator,
     from custom_components.felicity_solar import coordinator as module
     from types import SimpleNamespace
 
-    coordinator.battery_http_polling = True
+    assert coordinator.battery_http_polling is True
     coordinator._metadata.clear()
     coordinator.api.devices = {
         'battery': {'deviceSn': 'battery', 'deviceType': 'BP'},
@@ -249,7 +249,7 @@ async def test_battery_http_api_rejects_inverters_before_network(coordinator):
     coordinator.api._ensure_authenticated.assert_not_awaited()
 
 
-async def test_options_form_defaults_to_websocket_only(coordinator):
+async def test_options_form_defaults_to_fast_inverter_and_slow_battery(coordinator):
     from types import SimpleNamespace
     flow = FelicitySolarOptionsFlowHandler()
     flow.hass = SimpleNamespace(config_entries=SimpleNamespace(
@@ -257,4 +257,4 @@ async def test_options_form_defaults_to_websocket_only(coordinator):
     flow.handler = coordinator.config_entry.entry_id
     result = await flow.async_step_init()
     validated = result['data_schema']({})
-    assert validated == {'realtime_interval': 5, 'battery_http_polling': False}
+    assert validated == {'realtime_interval': 5, 'battery_http_polling': True}

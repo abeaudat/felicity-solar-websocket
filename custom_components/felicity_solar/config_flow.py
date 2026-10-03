@@ -4,7 +4,7 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 
-from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL, CONF_BATTERY_HTTP
+from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL, CONF_BATTERY_HTTP, DEFAULT_BATTERY_HTTP
 from .api import FelicitySolarAPI, create_felicity_client_session
 
 _LOGGER = logging.getLogger(__name__)
@@ -131,6 +131,6 @@ class FelicitySolarOptionsFlowHandler(config_entries.OptionsFlow):
                     )
                 ),
                 vol.Optional(CONF_BATTERY_HTTP, default=self.config_entry.options.get(
-                    CONF_BATTERY_HTTP, False)): selector.BooleanSelector(),
+                    CONF_BATTERY_HTTP, DEFAULT_BATTERY_HTTP)): selector.BooleanSelector(),
             }),
         )
