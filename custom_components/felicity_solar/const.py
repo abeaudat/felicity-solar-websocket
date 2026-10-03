@@ -1,5 +1,6 @@
 DOMAIN = "felicity_solar"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
-CONF_UPDATE_INTERVAL = "update_interval"
-DEFAULT_UPDATE_INTERVAL = 120
+# The old update_interval option is deliberately not interpreted as a WS delay.
+CONF_REALTIME_INTERVAL = "realtime_interval"
+DEFAULT_REALTIME_INTERVAL = 5

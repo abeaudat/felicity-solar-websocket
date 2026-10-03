@@ -283,6 +283,11 @@ class FelicityInverterSensor(CoordinatorEntity, SensorEntity):
         self._attr_device_info = device_info
 
     @property
+    def available(self) -> bool:
+        entry = self.coordinator.data.get(self.device_sn, {})
+        return super().available and entry.get("realtime_available", True)
+
+    @property
     def native_value(self):
         """Extract the exact key value from coordinator data."""
         device_data = self.coordinator.data.get(

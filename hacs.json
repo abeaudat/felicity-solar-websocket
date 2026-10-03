@@ -1,5 +1,7 @@
 {
-  "name": "Felicity Solar Integration (Smilebob)",
+  "name": "Felicity Solar WebSocket",
   "render_readme": true,
-  "homeassistant": "2026.02.2"
+  "homeassistant": "2026.9.4",
+  "zip_release": true,
+  "filename": "felicity_solar.zip"
 }

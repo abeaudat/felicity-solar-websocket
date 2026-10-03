@@ -16,16 +16,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def create_felicity_client_session(hass=None) -> aiohttp.ClientSession:
-    """Create an aiohttp ClientSession with SSL verification disabled.
-
-    The Felicity Solar API servers (shine.felicitysolar.com, shine-api.felicitysolar.com)
-    serve their leaf certificate without the intermediate CA, which causes
-    SSLCertVerificationError on most clients. We pass ssl=False to skip verification
-    only for requests made by this integration's session.
-    """
-    _LOGGER.info("Creating HTTP session with SSL verification disabled for Felicity Solar hosts")
-    connector = aiohttp.TCPConnector(ssl=False)
-    return aiohttp.ClientSession(connector=connector)
+    """Create an owned session with normal TLS certificate verification."""
+    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
 
 class DeviceTypeEnum(str, Enum):
@@ -42,7 +34,6 @@ class FelicitySolarAPI:
     JSON_FILE_PATH = "data/felicitySolarToken.json"
     LOGIN_URL = "https://shine.felicitysolar.com/login"
     API_URL_DEVICE_LIST = "https://shine-api.felicitysolar.com/device/list_device_all_type"
-    API_URL_DEVICE_SNAPSHOT = "https://shine-api.felicitysolar.com/device/get_device_snapshot"
     API_URL_USER_LOGIN = "https://shine-api.felicitysolar.com/userlogin"
     API_URL_REFRESH_TOKEN = "https://shine-api.felicitysolar.com/openApi/sec/refreshToken"
     API_URL_DEVICE_BASIC = "https://shine-api.felicitysolar.com/openApi/data/deviceDataBasic/"
@@ -61,6 +52,7 @@ class FelicitySolarAPI:
         self.token_expiration: datetime | None = None
         self.refresh_token: str | None = None
         self.devices_serial_numbers: list[str] = []
+        self.devices: dict[str, dict] = {}
         self.has_openapi_permissions: bool | None = None
 
     async def initialize(self) -> None:
@@ -109,7 +101,7 @@ class FelicitySolarAPI:
             self.has_openapi_permissions = False
             _LOGGER.warning(
                 "Felicity Cloud account %s does not have OpenAPI privileges (code 2001528). "
-                "Standard telemetry is 100%% functional, but remote controls and OpenAPI endpoints are disabled.",
+                "WebSocket telemetry remains separate; remote controls and OpenAPI endpoints are disabled.",
                 self.email,
             )
 
@@ -400,49 +392,6 @@ class FelicitySolarAPI:
             _LOGGER.warning("Failed to fetch history data for device %s: %s", device_sn, err)
         return {}
 
-    async def get_device_snapshot(self, device_sn: str) -> dict:
-        await self._ensure_authenticated()
-
-        _LOGGER.debug("Fetching snapshot for device %s", device_sn)
-        today_date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "authorization": self.bearer_token,
-            "content-type": "application/json",
-        }
-        payload = {
-            "deviceSn": device_sn,
-            "deviceType": "BP",
-            "dateStr": today_date_str
-        }
-
-        async with self.session.post(self.API_URL_DEVICE_SNAPSHOT, headers=headers, json=payload) as response:
-            response.raise_for_status()
-            data = await response.json()
-
-            code = data.get("code")
-            if code in (999, 998):
-                _LOGGER.warning("Token expired during snapshot fetch for %s, re-authenticating", device_sn)
-                await self._login()
-                return await self.get_device_snapshot(device_sn)
-
-            if "data" not in data:
-                _LOGGER.error("Snapshot response missing 'data' field for %s: %s", device_sn, data)
-                raise ValueError(f"Failed to get device snapshot: {data}")
-
-            device_data = data["data"]
-            if "productTypeEnum" not in device_data:
-                _LOGGER.error("Snapshot response missing 'productTypeEnum' for %s: %s", device_sn, device_data)
-                raise ValueError(f"Invalid device data: {device_data}")
-
-            _LOGGER.info(
-                "Snapshot received for %s (type=%s)",
-                device_sn, device_data.get("productTypeEnum", "unknown")
-            )
-            return device_data
-
-    # --- Private Methods ---
-
     def _is_logged_in(self) -> bool:
         if not self.bearer_token or not self.token_expiration:
             _LOGGER.debug("Not logged in: no token or expiration stored")
@@ -550,31 +499,28 @@ class FelicitySolarAPI:
         return False
 
     async def _load_devices_serial_numbers(self) -> None:
-        _LOGGER.debug("Fetching device list from API")
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "authorization": self.bearer_token,
-            "content-type": "application/json",
-        }
-        payload = {
-            "pageNum": 1,
-            "pageSize": 10,
-            "deviceSn": "",
-            "status": "",
-            "sampleFlag": "",
-            "oscFlag": ""
-        }
-
-        async with self.session.post(self.API_URL_DEVICE_LIST, headers=headers, json=payload) as response:
-            response.raise_for_status()
-            data = await response.json()
-            data_list = data.get("data", {}).get("dataList", [])
-            devices_sn = [device["deviceSn"] for device in data_list]
-            _LOGGER.info(
-                "Device list loaded: %d device(s) found — %s",
-                len(devices_sn), devices_sn
-            )
-            self.devices_serial_numbers = devices_sn
+        """Discover account-owned devices and the collector required by WS."""
+        headers = {"authorization": self.bearer_token, "content-type": "application/json"}
+        devices = {}
+        for page in range(1, 101):
+            payload = {"pageNum": page, "pageSize": 100, "deviceSn": "",
+                       "status": "", "sampleFlag": "", "oscFlag": ""}
+            async with self.session.post(self.API_URL_DEVICE_LIST, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                result = await response.json()
+            if result.get("code") not in (0, 200):
+                raise ValueError("FSolar device discovery failed")
+            data = result.get("data") or {}
+            rows = data.get("dataList") or []
+            for device in rows:
+                if device.get("deviceSn"):
+                    sn = str(device["deviceSn"])
+                    devices[sn] = {**device, "deviceSn": sn}
+            if len(rows) < 100:
+                break
+        self.devices = devices
+        self.devices_serial_numbers = list(devices)
+        _LOGGER.debug("Discovered %d FSolar devices", len(devices))
 
     async def _login(self) -> None:
         _LOGGER.info("Logging in to Felicity Solar as %s", self.email)

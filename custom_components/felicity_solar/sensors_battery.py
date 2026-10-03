@@ -245,7 +245,7 @@ class FelicityBatterySensor(CoordinatorEntity, SensorEntity):
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        if not super().available:
+        if not super().available or not self.coordinator.data.get(self.device_sn, {}).get("realtime_available", True):
             return False
         # For individual cell voltages: mark unavailable if the cell voltage is not reported
         # by the BMS/cloud API, avoiding 'unknown' clutter for unstreamed cells.

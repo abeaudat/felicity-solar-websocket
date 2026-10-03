@@ -1,12 +1,17 @@
 {
   "domain": "felicity_solar",
-  "name": "Felicity Solar (Smilebob Edition)",
-  "version": "1.1.4",
-  "documentation": "https://github.com/smilebob/felicity_solar_hacs",
-  "issue_tracker": "https://github.com/smilebob/felicity_solar_hacs/issues",
+  "name": "Felicity Solar WebSocket",
+  "version": "2.0.0",
+  "documentation": "https://github.com/abeaudat/felicity-solar-websocket",
+  "issue_tracker": "https://github.com/abeaudat/felicity-solar-websocket/issues",
   "dependencies": [],
-  "codeowners": ["@matheustavarestrindade", "@smilebob"],
-  "requirements": ["pycryptodome>=3.18.0", "PyJWT>=2.8.0"],
-  "iot_class": "cloud_polling",
+  "codeowners": [
+    "@abeaudat"
+  ],
+  "requirements": [
+    "pycryptodome>=3.18.0",
+    "PyJWT>=2.8.0"
+  ],
+  "iot_class": "cloud_push",
   "config_flow": true
 }

@@ -2,6 +2,7 @@ import sys
 import os
 import unittest
 import logging
+from unittest.mock import MagicMock
 
 # Ensure mock for homeassistant modules if not in HA venv
 try:
@@ -82,7 +83,7 @@ except ImportError:
     sys.modules["Crypto.Cipher"] = MagicMock()
     sys.modules["aiohttp"] = MagicMock()
 
-sys.path.insert(0, "/home/pierre/Projets/felicity_solar_hacs")
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from custom_components.felicity_solar.coordinator import (
     _parse_cell_voltage,

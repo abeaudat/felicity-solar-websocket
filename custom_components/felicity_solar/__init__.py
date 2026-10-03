@@ -1,10 +1,9 @@
 import logging
-from datetime import timedelta
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 
-from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
+from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL
 from .coordinator import FelicitySolarCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,12 +40,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Setting up Felicity Solar integration for %s", entry.data.get(CONF_EMAIL, "unknown"))
     hass.data.setdefault(DOMAIN, {})
 
-    # Extract the data saved by config_flow.py (prioritizing options flow for update_interval)
+    # Preserve the account config; use a separate realtime option from legacy HTTP polling
     email = entry.data[CONF_EMAIL]
     password = entry.data[CONF_PASSWORD]
-    update_interval = int(entry.options.get(CONF_UPDATE_INTERVAL, entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)))
+    update_interval = int(entry.options.get(CONF_REALTIME_INTERVAL, entry.data.get(CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL)))
 
-    _LOGGER.info("Update interval set to %d seconds", update_interval)
+    _LOGGER.info("WebSocket telemetry interval set to %d seconds", update_interval)
 
     # Boot up the background worker
     coordinator = FelicitySolarCoordinator(
@@ -54,13 +53,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         email=email,
         password=password,
         update_interval=update_interval,
+        config_entry=entry,
     )
+
+    async def async_stop_streams(_event):
+        await coordinator.async_close()
+
+    entry.async_on_unload(hass.bus.async_listen_once(
+        EVENT_HOMEASSISTANT_STOP, async_stop_streams,
+    ))
 
     # Listen for options changes (update interval adjustment)
     entry.async_on_unload(entry.add_update_listener(async_update_options))
 
     # Fetch the very first batch of data before creating the entities
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except BaseException:
+        await coordinator.async_close()
+        raise
 
     # Store the coordinator in memory
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -71,7 +82,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Forward setup to all platforms
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await coordinator.async_close()
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
 
     # Register custom Home Assistant services
     async def async_handle_set_setting(call: ServiceCall):
@@ -167,10 +183,9 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update coordinator update interval when options change."""
     coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if coordinator and isinstance(coordinator, FelicitySolarCoordinator):
-        new_interval = int(entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
-        coordinator.update_interval = timedelta(seconds=new_interval)
-        _LOGGER.info("Felicity Solar update interval dynamically changed to %d seconds", new_interval)
-        await coordinator.async_request_refresh()
+        new_interval = int(entry.options.get(CONF_REALTIME_INTERVAL, DEFAULT_REALTIME_INTERVAL))
+        coordinator.set_realtime_interval(new_interval)
+        _LOGGER.info("Felicity Solar WebSocket interval changed to %d seconds", new_interval)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -178,12 +193,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Unloading Felicity Solar integration for %s", entry.data.get(CONF_EMAIL, "unknown"))
 
     coordinator = hass.data[DOMAIN].get(entry.entry_id)
-    if coordinator and hasattr(coordinator, "_session"):
-        await coordinator._session.close()
-        _LOGGER.debug("Closed custom aiohttp session")
-
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        if coordinator:
+            await coordinator.async_close()
         hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
             for service in (

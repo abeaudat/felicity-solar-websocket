@@ -1,12 +1,15 @@
+import asyncio
 import json
 import logging
+import math
 import re
-from datetime import timedelta
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.core import HomeAssistant
 
 from .api import FelicitySolarAPI, DeviceTypeEnum, create_felicity_client_session
-from .const import DOMAIN
+from .const import DOMAIN, DEFAULT_REALTIME_INTERVAL
+from .realtime import FelicityRealtimeClient, normalize_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -14,8 +17,9 @@ _LOGGER = logging.getLogger(__name__)
 def _safe_float(value, default=0.0):
     """Convert value to float, returning default if value is None or invalid."""
     try:
-        return float(value) if value is not None and value != "" else default
-    except (ValueError, TypeError):
+        number = float(value) if value is not None and value != "" else default
+        return number if number is None or math.isfinite(number) else default
+    except (ValueError, TypeError, OverflowError):
         return default
 
 
@@ -23,7 +27,7 @@ def _safe_int(value, default=0):
     """Convert value to int, returning default if value is None or invalid."""
     try:
         return int(value) if value is not None and value != "" else default
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return default
 
 
@@ -210,441 +214,497 @@ WORK_MODE_MAP = {
 
 
 class FelicitySolarCoordinator(DataUpdateCoordinator):
-    """Coordinator to fetch data from Felicity Solar."""
+    """Push telemetry to existing entities; HTTP handles account metadata only."""
 
-    def __init__(self, hass: HomeAssistant, email: str, password: str, update_interval: int):
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(seconds=update_interval),
-        )
+    def __init__(self, hass: HomeAssistant, email: str, password: str,
+                 update_interval: int = DEFAULT_REALTIME_INTERVAL, *,
+                 config_entry: ConfigEntry | None = None):
+        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=None,
+                         config_entry=config_entry)
         self._session = create_felicity_client_session(hass)
-        self.api = FelicitySolarAPI(
-            email=email,
-            password=password,
-            session=self._session
-        )
+        self.api = FelicitySolarAPI(email=email, password=password, session=self._session)
         self._unsupported_cells_logged: set[str] = set()
+        self._clients: dict[str, FelicityRealtimeClient] = {}
+        self._metadata: dict[str, dict] = {}
+        self._snapshots: dict[str, dict] = {}
+        self._power_scales: dict[str, float] = {}
+        self._entries: dict[str, dict] = {}
+        self._initialized = False
+        self._closed = False
+        self.realtime_interval = update_interval
+
+    def _publish(self) -> None:
+        if not self._closed:
+            self.async_set_updated_data(dict(self._entries))
+
+    def _on_status(self, device_sn: str, available: bool) -> None:
+        entry = self._entries.get(device_sn)
+        if entry is not None and entry.get("realtime_available") != available:
+            self._entries[device_sn] = {**entry, "realtime_available": available}
+            self._publish()
+
+    def _on_frame(self, device_sn: str, frame: dict) -> None:
+        if self._closed:
+            return
+        snapshot, scale = normalize_snapshot(frame, self._power_scales.get(device_sn, 1.0))
+        self._power_scales[device_sn] = scale
+        # Merge partial live updates without clearing unstreamed static fields.
+        previous = self._snapshots.get(device_sn, {})
+        snapshot = {**previous, **{key: value for key, value in snapshot.items() if value is not None}}
+        meta = self._metadata[device_sn]
+        snapshot.setdefault("productTypeEnum", meta["productTypeEnum"])
+        snapshot.setdefault("deviceModel", meta.get("deviceModel"))
+        self._snapshots[device_sn] = snapshot
+        self._entries[device_sn] = {
+            **self._map_snapshot(device_sn, snapshot, meta, meta.get("warnings", []), meta.get("settings", {})),
+            "realtime_available": True,
+        }
+        self._publish()
 
     async def _async_update_data(self) -> dict[str, dict]:
-        """Fetch data from API for all devices."""
+        """Set up streams or refresh settings; never retrieve HTTP telemetry."""
         try:
-            _LOGGER.info("Starting data update cycle")
-
-            # Re-auth and load devices if needed
-            await self.api.initialize()
-
-            devices_data = {}
-            serial_numbers = self.api.get_devices_serial_numbers()
-
-            if not serial_numbers:
-                _LOGGER.warning("No devices found — check your Felicity Solar account or credentials")
-                return devices_data
-
-            for device_sn in serial_numbers:
-                try:
-                    snapshot = await self.api.get_device_snapshot(device_sn)
-                    basic_info = await self.api.get_device_basic_info(device_sn)
-                    warnings = await self.api.get_device_warnings(device_sn)
-
-                    device_type = snapshot.get("productTypeEnum")
-                    firmware_version = basic_info.get("firmwareVersion") or snapshot.get("firmwareVersion")
-                    warn_count = len(warnings)
-                    last_warn_msg = str(warnings[0].get("warnMsg") or warnings[0].get("name") or warnings[0].get("msg", "Normal")) if warnings else "Normal"
-
-                    _LOGGER.info("Snapshot received for device %s (productTypeEnum='%s', firmware='%s', warnings=%d)", device_sn, device_type, firmware_version, warn_count)
-
-                    is_battery = (
-                        device_type == DeviceTypeEnum.LITHIUM_BATTERY_PACK
-                        or (isinstance(device_type, str) and "BATTERY" in device_type.upper())
+            if not self._initialized:
+                await self.api.initialize()
+                if not self.api.devices:
+                    raise UpdateFailed("No devices found in this FSolar account")
+                for device_sn, discovered in self.api.devices.items():
+                    basic = await self.api.get_device_basic_info(device_sn)
+                    meta = {**discovered, **{k: v for k, v in basic.items() if v is not None}}
+                    product_type = meta.get("productTypeEnum") or meta.get("deviceType")
+                    is_battery = "BATTERY" in str(product_type).upper() or product_type == "BP"
+                    meta["productTypeEnum"] = (DeviceTypeEnum.LITHIUM_BATTERY_PACK if is_battery
+                                               else product_type or DeviceTypeEnum.HIGH_FREQUENCY_INVERTER)
+                    meta["warnings"] = await self.api.get_device_warnings(device_sn)
+                    meta["settings"] = {} if is_battery else await self.api.get_device_settings(device_sn)
+                    self._metadata[device_sn] = meta
+                    self._entries[device_sn] = {
+                        "type": (DeviceTypeEnum.LITHIUM_BATTERY_PACK if is_battery
+                                 else DeviceTypeEnum.HIGH_FREQUENCY_INVERTER),
+                        "serialNumber": device_sn, "collectorSn": meta.get("collectorSn"),
+                        "modelName": meta.get("deviceModel") or meta.get("model"),
+                        "firmwareVersion": meta.get("firmwareVersion"),
+                        "settings": meta["settings"], "data": {}, "realtime_available": False,
+                    }
+                    collector_sn = meta.get("collectorSn2") or meta.get("collectorSn")
+                    if not collector_sn:
+                        _LOGGER.warning("Device %s has no collector SN; realtime unavailable", device_sn)
+                        continue
+                    client = FelicityRealtimeClient(
+                        self._session, device_sn, str(collector_sn),
+                        lambda frame, sn=device_sn: self._on_frame(sn, frame),
+                        lambda available, sn=device_sn: self._on_status(sn, available),
+                        interval=self.realtime_interval,
                     )
-
-                    if is_battery:
-                        state_val = _safe_int(snapshot.get("bmsChargingState"), -1)
-                        if state_val == 1:
-                            charging_state = "Charging"
-                        elif state_val == 0:
-                            charging_state = "Idle"
-                        elif state_val == 2:
-                            charging_state = "Discharging"
-                        else:
-                            charging_state = "Unknown"
-
-                        max_cell_v = _parse_cell_voltage(snapshot.get("maxVoltage2bms"))
-                        min_cell_v = _parse_cell_voltage(snapshot.get("minVoltage2bms"))
-
-                        # Parse individual cell voltages (1 to 16) with multi-key and list decoders
-                        voltage_list = _extract_voltage_list(snapshot)
-                        cell_voltages = {}
-                        for i in range(1, 17):
-                            raw_v = _get_cell_raw_value(snapshot, i, voltage_list)
-                            cell_voltages[f"cellVolt{i}"] = _parse_cell_voltage(raw_v)
-
-                        # Fallback for max/min cell voltage from individual cells if not provided directly
-                        valid_cells = [v for v in cell_voltages.values() if v is not None]
-                        if max_cell_v is None and valid_cells:
-                            max_cell_v = max(valid_cells)
-                        if min_cell_v is None and valid_cells:
-                            min_cell_v = min(valid_cells)
-
-                        if max_cell_v is not None and min_cell_v is not None:
-                            dv_cells = round(abs(max_cell_v - min_cell_v), 1)
-                        else:
-                            dv_cells = None
-
-                        max_cell_num = _safe_int(snapshot.get("maxVoltageNum2bms"), default=None)
-                        min_cell_num = _safe_int(snapshot.get("minVoltageNum2bms"), default=None)
-
-                        # Diagnostics logging for battery cell telemetry
-                        battery_cell_telemetry = {
-                            k: v for k, v in snapshot.items()
-                            if any(term in k.lower() for term in ("volt", "cell", "bms"))
-                        }
-                        _LOGGER.debug(
-                            "Battery %s raw cell/voltage/BMS telemetry: %s",
-                            device_sn,
-                            battery_cell_telemetry,
-                        )
-                        if valid_cells:
-                            _LOGGER.info(
-                                "Battery %s parsed %d/16 cell voltages (min=%.1f mV, max=%.1f mV, dV=%.1f mV)",
-                                device_sn,
-                                len(valid_cells),
-                                min_cell_v if min_cell_v is not None else 0.0,
-                                max_cell_v if max_cell_v is not None else 0.0,
-                                dv_cells if dv_cells is not None else 0.0,
-                            )
-                            self._unsupported_cells_logged.discard(device_sn)
-                        else:
-                            if device_sn not in self._unsupported_cells_logged:
-                                self._unsupported_cells_logged.add(device_sn)
-                                _LOGGER.info(
-                                    "Battery %s does not report individual cell voltages via cloud API (min/max cell telemetry and dV remain active)",
-                                    device_sn,
-                                )
-                            _LOGGER.debug(
-                                "Battery %s individual cell voltages not available. Raw telemetry: %s",
-                                device_sn,
-                                battery_cell_telemetry,
-                            )
-
-                        batt_volt = _safe_float(snapshot.get("battVolt"), default=None)
-                        batt_curr = _safe_float(snapshot.get("battCurr"), default=None)
-                        batt_soc = _safe_int(snapshot.get("battSoc"), default=None)
-                        batt_soh = _safe_int(snapshot.get("battSoh"), default=None)
-                        batt_capacity = _safe_float(snapshot.get("battCapacity"), default=None)
-
-                        # Derive and normalize rated energy in kWh
-                        raw_rated_energy = _safe_float(snapshot.get("ratedEnergy"), default=None)
-                        if raw_rated_energy is not None and raw_rated_energy > 100:
-                            rated_energy_kwh = round(raw_rated_energy / 1000.0, 2)
-                        elif raw_rated_energy is not None and raw_rated_energy > 0:
-                            rated_energy_kwh = round(raw_rated_energy, 2)
-                        elif batt_capacity is not None and batt_capacity > 0 and batt_volt is not None and batt_volt > 0:
-                            rated_energy_kwh = round((batt_capacity * batt_volt) / 1000.0, 2)
-                        else:
-                            rated_energy_kwh = None
-
-                        remaining_energy = _calculate_battery_remaining_energy(
-                            snapshot, batt_soc, batt_volt, batt_capacity, rated_energy_kwh
-                        )
-
-                        _LOGGER.debug(
-                            "Battery %s energy telemetry: remaining=%s kWh, rated=%s kWh, capacity=%s Ah, volt=%s V, soc=%s%%",
-                            device_sn,
-                            remaining_energy,
-                            rated_energy_kwh,
-                            batt_capacity,
-                            batt_volt,
-                            batt_soc,
-                        )
-
-                        # Derive physical cell count safely (cellNumber in API is often pack address e.g. 3)
-                        raw_cell_num = _safe_int(snapshot.get("cellNumber"), default=None)
-                        if raw_cell_num is not None and (raw_cell_num < 8 or (max_cell_num is not None and raw_cell_num < max_cell_num)):
-                            rate_volt = _safe_float(snapshot.get("rateVolt"), default=None)
-                            if (batt_volt is not None and batt_volt > 40) or (rate_volt is not None and rate_volt >= 48):
-                                cell_count = 16
-                            elif max_cell_num is not None and max_cell_num > 0:
-                                cell_count = max(16, max_cell_num)
-                            else:
-                                cell_count = None
-                        else:
-                            cell_count = raw_cell_num
-
-                        # BMS Communication Status for Battery
-                        bms_status_str = snapshot.get("bmsFlagStr")
-                        if not bms_status_str or bms_status_str == "-":
-                            bms_flag_val = snapshot.get("bmsFlag")
-                            if bms_flag_val is True or bms_flag_val == "true" or bms_flag_val == 1:
-                                bms_status_str = "Connected"
-                            elif bms_flag_val is False or bms_flag_val == "false" or bms_flag_val == 0:
-                                bms_status_str = "Disconnected"
-                            else:
-                                bms_status_str = None
-
-                        devices_data[device_sn] = {
-                            "type": DeviceTypeEnum.LITHIUM_BATTERY_PACK,
-                            "serialNumber": device_sn,
-                            "firmwareVersion": firmware_version,
-                            "collectorSn": basic_info.get("collectorSn"),
-                            "data": {
-                                "voltage": batt_volt if batt_volt is not None else 0.0,
-                                "current": batt_curr if batt_curr is not None else 0.0,
-                                "soc": batt_soc if batt_soc is not None else 0,
-                                "soh": batt_soh if batt_soh is not None else 0,
-                                "ratedEnergy": rated_energy_kwh,
-                                "energyUnit": str(snapshot.get("energyUnit", "")),
-                                "nameplateRatedPower": str(snapshot.get("nameplateRatedPower", "")),
-                                "power": _safe_float(snapshot.get("bmsPower")),
-                                "chargingState": charging_state,
-                                "tempMax": _safe_float(snapshot.get("tempMax")),
-                                "tempMin": _safe_float(snapshot.get("tempMin")),
-                                "remainingEnergy": remaining_energy,
-                                "capacity": batt_capacity if batt_capacity is not None else 0.0,
-                                "maxCellVoltage": max_cell_v,
-                                "minCellVoltage": min_cell_v,
-                                "maxCellVoltageNum": max_cell_num,
-                                "minCellVoltageNum": min_cell_num,
-                                "dvCells": dv_cells,
-                                **cell_voltages,
-                                "emsSocAvg": _safe_int(snapshot.get("emsSocAvg")),
-                                "wifiSignal": _safe_int(snapshot.get("wifiSignal")),
-                                "cellTemp1": _safe_float(snapshot.get("cellTemp1"), default=None),
-                                "cellTemp2": _safe_float(snapshot.get("cellTemp2"), default=None),
-                                "cellTemp3": _safe_float(snapshot.get("cellTemp3"), default=None),
-                                "cellTemp4": _safe_float(snapshot.get("cellTemp4"), default=None),
-                                "chargeLimitVoltage": _safe_float(snapshot.get("BMSLCVolt")),
-                                "dischargeLimitVoltage": _safe_float(snapshot.get("BMSLDVolt")),
-                                "chargeLimitCurrent": _safe_float(snapshot.get("BMSLCCurr"), default=None),
-                                "dischargeLimitCurrent": _safe_float(snapshot.get("BMSLDCurr"), default=None),
-                                "cellCount": cell_count,
-                                "maxCellTempNum": _safe_int(snapshot.get("maxCellTempNum"), default=None),
-                                "minCellTempNum": _safe_int(snapshot.get("minBattTempNum"), default=None),
-                                "batteryType": str(snapshot.get("batTyStr")) if snapshot.get("batTyStr") else None,
-                                "connectedInverterSn": str(snapshot.get("invSn")) if snapshot.get("invSn") else None,
-                                "bmsCommunicationStatus": bms_status_str,
-                                "warnCount": warn_count,
-                                "lastWarnMsg": last_warn_msg,
-                            }
-                        }
-                    else:
-                        settings = await self.api.get_device_settings(device_sn)
-                        previous_settings = self.data.get(device_sn, {}).get("settings", {}) if self.data else {}
-                        if not settings and previous_settings:
-                            _LOGGER.info(
-                                "Preserving %d cached settings for inverter %s after empty query",
-                                len(previous_settings),
-                                device_sn,
-                            )
-                            settings = previous_settings
-                        elif not settings and self.api.has_openapi_permissions is not False:
-                            _LOGGER.warning(
-                                "Inverter %s settings are empty — remote control entities (select, number, switch) will show 'unknown'",
-                                device_sn,
-                            )
-                        raw_model = snapshot.get("deviceModel") or snapshot.get("model") or snapshot.get("productTypeEnum") or "Solar Inverter"
-                        model_display = str(raw_model).replace("_", " ").title()
-                        if "Felicity" not in model_display:
-                            model_display = f"Felicity {model_display}"
-
-                        # Handle rated power calculation (stored in kW)
-                        raw_rated = _safe_float(snapshot.get("ratedPower") or snapshot.get("nameplateRatedPower") or snapshot.get("ratePower"))
-                        if raw_rated > 100:
-                            # If value is returned in Watts (e.g. 6000), convert to kW
-                            raw_rated = raw_rated / 1000.0
-                        
-                        # Fallback parsing from model name if API returned 0 / missing
-                        if raw_rated == 0:
-                            match = re.search(r"(\d+)\s*K", model_display.upper())
-                            if match:
-                                raw_rated = float(match.group(1))
-
-                        # Handle PV Power calculation (raw API or sum of dual/quad MPPT)
-                        pv1_power = _safe_float(snapshot.get("pv1Power") or snapshot.get("pvPower1"))
-                        pv2_power = _safe_float(snapshot.get("pv2Power") or snapshot.get("pvPower2"))
-                        pv3_power = _safe_float(snapshot.get("pv3Power") or snapshot.get("pvPower3"))
-                        pv4_power = _safe_float(snapshot.get("pv4Power") or snapshot.get("pvPower4"))
-                        raw_pv_power = _safe_float(snapshot.get("pvPower"))
-                        raw_pv_total_power = _safe_float(snapshot.get("pvTotalPower"))
-
-                        total_pv_power = raw_pv_total_power or raw_pv_power
-                        if total_pv_power == 0 and (pv1_power > 0 or pv2_power > 0 or pv3_power > 0 or pv4_power > 0):
-                            total_pv_power = pv1_power + pv2_power + pv3_power + pv4_power
-
-                        # Battery charge / discharge powers calculation
-                        ems_power = _safe_float(snapshot.get("emsPower"))
-                        bms_state = _safe_int(snapshot.get("bmsChargingState"), -1)
-                        if bms_state == 1:
-                            battery_charging_power = abs(ems_power)
-                            battery_discharging_power = 0.0
-                        elif bms_state == 2:
-                            battery_charging_power = 0.0
-                            battery_discharging_power = abs(ems_power)
-                        else:
-                            battery_charging_power = ems_power if ems_power > 0 else 0.0
-                            battery_discharging_power = abs(ems_power) if ems_power < 0 else 0.0
-
-                        # BMS Communication Status
-                        bms_flag_val = snapshot.get("bmsFlag")
-                        if bms_flag_val is True or bms_flag_val == "true" or bms_flag_val == 1:
-                            bms_status = "Connected"
-                        elif bms_flag_val is False or bms_flag_val == "false" or bms_flag_val == 0:
-                            bms_status = "Disconnected"
-                        else:
-                            bms_status = None
-
-                        devices_data[device_sn] = {
-                            "type": DeviceTypeEnum.HIGH_FREQUENCY_INVERTER,
-                            "productTypeEnum": device_type,
-                            "modelName": model_display,
-                            "serialNumber": device_sn,
-                            "firmwareVersion": firmware_version,
-                            "collectorSn": basic_info.get("collectorSn"),
-                            "settings": settings,
-                            "data": {
-                                "acInputVoltage": _safe_float(snapshot.get("acRInVolt")),
-                                "acInputFrequency": _safe_float(snapshot.get("acRInFreq")),
-                                "acInputPower": _safe_float(snapshot.get("acRInPower")),
-                                "acGridCurrentL1": _safe_float(snapshot.get("acRInCurr")),
-                                "acGridCurrentL2": _safe_float(snapshot.get("acSInCurr")),
-                                "acGridCurrentL3": _safe_float(snapshot.get("acTInCurr")),
-                                "acGridVoltageL2": _safe_float(snapshot.get("acSInVolt")),
-                                "acGridVoltageL3": _safe_float(snapshot.get("acTInVolt")),
-                                "acGridFrequencyL2": _safe_float(snapshot.get("acSInFreq")),
-                                "acGridFrequencyL3": _safe_float(snapshot.get("acTInFreq")),
-                                "acGridPowerL1": _safe_float(snapshot.get("acRInPower")),
-                                "acGridPowerL2": _safe_float(snapshot.get("acSInPower")),
-                                "acGridPowerL3": _safe_float(snapshot.get("acTInPower")),
-                                "acTotalGridPower": _safe_float(snapshot.get("acTtlInpower") or snapshot.get("acRInPower")),
-                                "acOutputVoltage": _safe_float(snapshot.get("acROutVolt")),
-                                "acOutputCurrent": _safe_float(snapshot.get("acROutCurr")),
-                                "acOutputFrequency": _safe_float(snapshot.get("acROutFreq")),
-                                "acTotalOutputActivePower": _safe_float(snapshot.get("acTotalOutActPower")),
-                                "acTotalBackupApparentPower": _safe_float(snapshot.get("acTotalOutAppaPower")),
-                                "acBackupVoltageL2": _safe_float(snapshot.get("acSOutVolt")),
-                                "acBackupVoltageL3": _safe_float(snapshot.get("acTOutVolt")),
-                                "acBackupCurrentL1": _safe_float(snapshot.get("acROutCurr")),
-                                "acBackupCurrentL2": _safe_float(snapshot.get("acSOutCurr")),
-                                "acBackupCurrentL3": _safe_float(snapshot.get("acTOutCurr")),
-                                "acBackupPowerL1": _safe_float(snapshot.get("acROutPower")),
-                                "acBackupPowerL2": _safe_float(snapshot.get("acSOutPower")),
-                                "acBackupPowerL3": _safe_float(snapshot.get("acTOutPower")),
-                                "loadPercentage": _safe_float(snapshot.get("loadPercent")),
-                                "pvVoltage": _safe_float(snapshot.get("pvVolt")),
-                                "pvInputCurrent": _safe_float(snapshot.get("pvInCurr")),
-                                "pvPower": raw_pv_power or total_pv_power,
-                                "pvTotalPower": total_pv_power,
-                                "pv1Voltage": _safe_float(snapshot.get("pv1Volt") or snapshot.get("pvVolt1") or snapshot.get("pvVolt")),
-                                "pv1Current": _safe_float(snapshot.get("pv1InCurr") or snapshot.get("pvInCurr1") or snapshot.get("pvInCurr")),
-                                "pv1Power": pv1_power or raw_pv_power,
-                                "pv2Voltage": _safe_float(snapshot.get("pv2Volt") or snapshot.get("pvVolt2")),
-                                "pv2Current": _safe_float(snapshot.get("pv2InCurr") or snapshot.get("pvInCurr2")),
-                                "pv2Power": pv2_power,
-                                "pv3Voltage": _safe_float(snapshot.get("pv3Volt") or snapshot.get("pvVolt3")),
-                                "pv3Current": _safe_float(snapshot.get("pv3InCurr") or snapshot.get("pvInCurr3")),
-                                "pv3Power": pv3_power,
-                                "pv4Voltage": _safe_float(snapshot.get("pv4Volt") or snapshot.get("pvVolt4")),
-                                "pv4Current": _safe_float(snapshot.get("pv4InCurr") or snapshot.get("pvInCurr4")),
-                                "pv4Power": pv4_power,
-                                "ctPower": _safe_float(snapshot.get("ctPower")),
-                                "meterPower": _safe_float(snapshot.get("meterPower")),
-                                "totalConsumptionPower": _safe_float(snapshot.get("totalConsumPower")),
-                                "genPower": _safe_float(snapshot.get("genTotalPower") or snapshot.get("genPower")),
-                                "genVoltage": _safe_float(snapshot.get("genVoltage")),
-                                "genCurrent": _safe_float(snapshot.get("genCurrent")),
-                                "genFrequency": _safe_float(snapshot.get("genFrequency")),
-                                "batteryVoltage": _safe_float(snapshot.get("emsVoltage") or snapshot.get("battVolt")),
-                                "batteryCurrent": _safe_float(snapshot.get("emsCurrent") or snapshot.get("battCurr")),
-                                "batteryPower": ems_power,
-                                "batteryChargingPower": round(battery_charging_power, 2),
-                                "batteryDischargingPower": round(battery_discharging_power, 2),
-                                "batterySoc": _safe_int(snapshot.get("emsSoc") or snapshot.get("battSoc")),
-                                "bmsCommunicationStatus": bms_status,
-                                "battery2Voltage": _safe_float(snapshot.get("emsVoltage2")),
-                                "battery2Current": _safe_float(snapshot.get("emsCurrent2")),
-                                "battery2Power": _safe_float(snapshot.get("emsPower2")),
-                                "battery2Soc": _safe_int(snapshot.get("emsSoc2")),
-                                "tempMax": _safe_float(snapshot.get("tempMax")),
-                                "devTempMax": _safe_float(snapshot.get("devTempMax")),
-                                "devTempMin": _safe_float(snapshot.get("devTempMin")),
-                                "energyPvToday": _safe_float(snapshot.get("ePvToday") or snapshot.get("epvToday")),
-                                "energyPvTotal": _safe_float(snapshot.get("ePvTotal")),
-                                "energyPvMonth": _safe_float(snapshot.get("ePvMonth")),
-                                "energyPvYear": _safe_float(snapshot.get("ePvYear")),
-                                "energyLoadToday": _safe_float(snapshot.get("eLoadToday")),
-                                "energyLoadTotal": _safe_float(snapshot.get("eLoadTotal")),
-                                "energyLoadMonth": _safe_float(snapshot.get("eLoadMonth")),
-                                "energyLoadYear": _safe_float(snapshot.get("eLoadYear")),
-                                "energyGridFeedToday": _safe_float(snapshot.get("eGridFeedToday") or snapshot.get("egridFeedToday")),
-                                "energyGridFeedTotal": _safe_float(snapshot.get("eGridFeedTotal") or snapshot.get("egridFeedTotal")),
-                                "energyGridFeedMonth": _safe_float(snapshot.get("eGridFeedMonth") or snapshot.get("egridFeedMonth")),
-                                "energyGridFeedYear": _safe_float(snapshot.get("eGridFeedYear") or snapshot.get("egridFeedYear")),
-                                "energyGridImportToday": _safe_float(snapshot.get("eToday") or snapshot.get("etoday")),
-                                "energyGridImportTotal": _safe_float(snapshot.get("eTotal") or snapshot.get("etotal")),
-                                "energyGridImportMonth": _safe_float(snapshot.get("eMonth") or snapshot.get("emonth")),
-                                "energyGridImportYear": _safe_float(snapshot.get("eYear") or snapshot.get("eyear")),
-                                "energyBatteryChargeToday": _safe_float(
-                                    snapshot.get("eBatCharToday") or snapshot.get("ebatCharToday") or snapshot.get("bat1CharToday")
-                                ),
-                                "energyBatteryChargeMonth": _safe_float(
-                                    snapshot.get("eBatCharMonth") or snapshot.get("ebatCharMonth") or snapshot.get("bat1CharMonth")
-                                ),
-                                "energyBatteryChargeYear": _safe_float(
-                                    snapshot.get("eBatCharYear") or snapshot.get("ebatCharYear") or snapshot.get("bat1CharYear")
-                                ),
-                                "energyBatteryChargeTotal": _safe_float(
-                                    snapshot.get("eBatCharTotal") or snapshot.get("ebatCharTotal") or snapshot.get("bat1CharTotal")
-                                ),
-                                "energyBatteryDischargeToday": _safe_float(
-                                    snapshot.get("eBatDisCharToday") or snapshot.get("ebatDischarToday") or snapshot.get("ebatDisCharToday") or snapshot.get("bat1DisCharToday")
-                                ),
-                                "energyBatteryDischargeMonth": _safe_float(
-                                    snapshot.get("eBatDisCharMonth") or snapshot.get("ebatDischarMonth") or snapshot.get("ebatDisCharMonth") or snapshot.get("bat1DisCharMonth")
-                                ),
-                                "energyBatteryDischargeYear": _safe_float(
-                                    snapshot.get("eBatDisCharYear") or snapshot.get("ebatDischarYear") or snapshot.get("ebatDisCharYear") or snapshot.get("bat1DisCharYear")
-                                ),
-                                "energyBatteryDischargeTotal": _safe_float(
-                                    snapshot.get("eBatDisCharTotal") or snapshot.get("ebatDischarTotal") or snapshot.get("ebatDisCharTotal") or snapshot.get("bat1DisCharTotal")
-                                ),
-                                "totalEnergy": _safe_float(snapshot.get("totalEnergy")),
-                                "smartLoadPower": _safe_float(snapshot.get("smartTotalPower") or snapshot.get("smartLoadPower")),
-                                "smartLoadVoltage": _safe_float(snapshot.get("smartLoadVolt")),
-                                "smartLoadCurrent": _safe_float(snapshot.get("smartLoadCurr")),
-                                "smartLoadFrequency": _safe_float(snapshot.get("smartLoadFreq")),
-                                "smartLoadEnergyToday": _safe_float(snapshot.get("smartLoadToday")),
-                                "smartLoadEnergyTotal": _safe_float(snapshot.get("smartLoadTotal")),
-                                "energyGenToday": _safe_float(snapshot.get("genToday")),
-                                "energyGenTotal": _safe_float(snapshot.get("genTotal")),
-                                "genPowerL2": _safe_float(snapshot.get("genPower2")),
-                                "genPowerL3": _safe_float(snapshot.get("genPower3")),
-                                "meterLinkStatus": str(snapshot.get("electricityMeterLinkStr")) if snapshot.get("electricityMeterLinkStr") else None,
-                                "totalEmsCapacity": _safe_float(snapshot.get("totalEmsCapacity")),
-                                "workModeStr": snapshot.get("workModeStr") or snapshot.get("operMStr"),
-                                "ratedPower": raw_rated,
-                                "workMode": WORK_MODE_MAP.get(
-                                    _safe_int(snapshot.get("workMode") if snapshot.get("workMode") is not None else snapshot.get("workModel"), -1),
-                                    "Unknown"
-                                ),
-                                "warnCount": warn_count,
-                                "lastWarnMsg": last_warn_msg,
-                            }
-                        }
-
-                    _LOGGER.debug("Data fetched successfully for %s (%s)", device_sn, device_type)
-
-                except Exception as err:
-                    _LOGGER.error("Failed to fetch snapshot for device %s: %s", device_sn, err)
-                    continue
-
-            _LOGGER.info(
-                "Data update complete: %d device(s) with data out of %d",
-                len(devices_data), len(serial_numbers)
-            )
-            return devices_data
-
+                    self._clients[device_sn] = client
+                    client.start()
+                self._initialized = True
+                if self._clients:
+                    try:
+                        async with asyncio.timeout(25):
+                            await asyncio.gather(*(c.first_frame.wait() for c in self._clients.values()))
+                    except TimeoutError:
+                        _LOGGER.warning("Some FSolar streams have not delivered their first frame; reconnect remains active")
+            else:
+                # Called after a user changes a device setting. Keep live data
+                # intact, and refresh only the separate settings/alarms metadata.
+                for sn, meta in self._metadata.items():
+                    meta["warnings"] = await self.api.get_device_warnings(sn)
+                    if self._entries[sn]["type"] != DeviceTypeEnum.LITHIUM_BATTERY_PACK:
+                        settings = await self.api.get_device_settings(sn)
+                        if settings:
+                            meta["settings"] = settings
+                    if sn in self._snapshots:
+                        mapped = self._map_snapshot(sn, self._snapshots[sn], meta,
+                                                    meta["warnings"], meta["settings"])
+                        self._entries[sn] = {**mapped, "realtime_available": self._entries[sn]["realtime_available"]}
+            return dict(self._entries)
+        except UpdateFailed:
+            raise
         except Exception as err:
-            _LOGGER.error("Update failed: %s", err)
-            raise UpdateFailed(f"Error communicating with API: {err}")
+            raise UpdateFailed("Error setting up FSolar realtime telemetry") from err
+
+    async def async_close(self) -> None:
+        """Cancel all listeners before closing the owned session."""
+        self._closed = True
+        await asyncio.gather(*(client.stop() for client in self._clients.values()))
+        self._clients.clear()
+        await self._session.close()
+
+    def set_realtime_interval(self, seconds: int) -> None:
+        self.realtime_interval = seconds
+        for client in self._clients.values():
+            client.interval = seconds
+
+    def _map_snapshot(self, device_sn: str, snapshot: dict, basic_info: dict,
+                      warnings: list, settings: dict) -> dict:
+        """Reuse upstream telemetry mapping while preserving entity keys."""
+        device_type = snapshot.get("productTypeEnum")
+        firmware_version = basic_info.get("firmwareVersion") or snapshot.get("firmwareVersion")
+        warn_count = len(warnings)
+        last_warn_msg = str(warnings[0].get("warnMsg") or warnings[0].get("name") or warnings[0].get("msg", "Normal")) if warnings else "Normal"
+        is_battery = (
+            device_type == DeviceTypeEnum.LITHIUM_BATTERY_PACK
+            or (isinstance(device_type, str) and "BATTERY" in device_type.upper())
+        )
+
+        if is_battery:
+            state_val = _safe_int(snapshot.get("bmsChargingState"), -1)
+            if state_val == 1:
+                charging_state = "Charging"
+            elif state_val == 0:
+                charging_state = "Idle"
+            elif state_val == 2:
+                charging_state = "Discharging"
+            else:
+                charging_state = "Unknown"
+
+            max_cell_v = _parse_cell_voltage(snapshot.get("maxVoltage2bms"))
+            min_cell_v = _parse_cell_voltage(snapshot.get("minVoltage2bms"))
+
+            # Parse individual cell voltages (1 to 16) with multi-key and list decoders
+            voltage_list = _extract_voltage_list(snapshot)
+            cell_voltages = {}
+            for i in range(1, 17):
+                raw_v = _get_cell_raw_value(snapshot, i, voltage_list)
+                cell_voltages[f"cellVolt{i}"] = _parse_cell_voltage(raw_v)
+
+            # Fallback for max/min cell voltage from individual cells if not provided directly
+            valid_cells = [v for v in cell_voltages.values() if v is not None]
+            if max_cell_v is None and valid_cells:
+                max_cell_v = max(valid_cells)
+            if min_cell_v is None and valid_cells:
+                min_cell_v = min(valid_cells)
+
+            if max_cell_v is not None and min_cell_v is not None:
+                dv_cells = round(abs(max_cell_v - min_cell_v), 1)
+            else:
+                dv_cells = None
+
+            max_cell_num = _safe_int(snapshot.get("maxVoltageNum2bms"), default=None)
+            min_cell_num = _safe_int(snapshot.get("minVoltageNum2bms"), default=None)
+
+            # Diagnostics logging for battery cell telemetry
+            battery_cell_telemetry = {
+                k: v for k, v in snapshot.items()
+                if any(term in k.lower() for term in ("volt", "cell", "bms"))
+            }
+            _LOGGER.debug(
+                "Battery %s raw cell/voltage/BMS telemetry: %s",
+                device_sn,
+                battery_cell_telemetry,
+            )
+            if valid_cells:
+                _LOGGER.debug(
+                    "Battery %s parsed %d/16 cell voltages (min=%.1f mV, max=%.1f mV, dV=%.1f mV)",
+                    device_sn,
+                    len(valid_cells),
+                    min_cell_v if min_cell_v is not None else 0.0,
+                    max_cell_v if max_cell_v is not None else 0.0,
+                    dv_cells if dv_cells is not None else 0.0,
+                )
+                self._unsupported_cells_logged.discard(device_sn)
+            else:
+                if device_sn not in self._unsupported_cells_logged:
+                    self._unsupported_cells_logged.add(device_sn)
+                    _LOGGER.info(
+                        "Battery %s does not report individual cell voltages via cloud API (min/max cell telemetry and dV remain active)",
+                        device_sn,
+                    )
+                _LOGGER.debug(
+                    "Battery %s individual cell voltages not available. Raw telemetry: %s",
+                    device_sn,
+                    battery_cell_telemetry,
+                )
+
+            batt_volt = _safe_float(snapshot.get("battVolt"), default=None)
+            batt_curr = _safe_float(snapshot.get("battCurr"), default=None)
+            batt_soc = _safe_int(snapshot.get("battSoc"), default=None)
+            batt_soh = _safe_int(snapshot.get("battSoh"), default=None)
+            batt_capacity = _safe_float(snapshot.get("battCapacity"), default=None)
+
+            # Derive and normalize rated energy in kWh
+            raw_rated_energy = _safe_float(snapshot.get("ratedEnergy"), default=None)
+            if raw_rated_energy is not None and raw_rated_energy > 100:
+                rated_energy_kwh = round(raw_rated_energy / 1000.0, 2)
+            elif raw_rated_energy is not None and raw_rated_energy > 0:
+                rated_energy_kwh = round(raw_rated_energy, 2)
+            elif batt_capacity is not None and batt_capacity > 0 and batt_volt is not None and batt_volt > 0:
+                rated_energy_kwh = round((batt_capacity * batt_volt) / 1000.0, 2)
+            else:
+                rated_energy_kwh = None
+
+            remaining_energy = _calculate_battery_remaining_energy(
+                snapshot, batt_soc, batt_volt, batt_capacity, rated_energy_kwh
+            )
+
+            _LOGGER.debug(
+                "Battery %s energy telemetry: remaining=%s kWh, rated=%s kWh, capacity=%s Ah, volt=%s V, soc=%s%%",
+                device_sn,
+                remaining_energy,
+                rated_energy_kwh,
+                batt_capacity,
+                batt_volt,
+                batt_soc,
+            )
+
+            # Derive physical cell count safely (cellNumber in API is often pack address e.g. 3)
+            raw_cell_num = _safe_int(snapshot.get("cellNumber"), default=None)
+            if raw_cell_num is not None and (raw_cell_num < 8 or (max_cell_num is not None and raw_cell_num < max_cell_num)):
+                rate_volt = _safe_float(snapshot.get("rateVolt"), default=None)
+                if (batt_volt is not None and batt_volt > 40) or (rate_volt is not None and rate_volt >= 48):
+                    cell_count = 16
+                elif max_cell_num is not None and max_cell_num > 0:
+                    cell_count = max(16, max_cell_num)
+                else:
+                    cell_count = None
+            else:
+                cell_count = raw_cell_num
+
+            # BMS Communication Status for Battery
+            bms_status_str = snapshot.get("bmsFlagStr")
+            if not bms_status_str or bms_status_str == "-":
+                bms_flag_val = snapshot.get("bmsFlag")
+                if bms_flag_val is True or bms_flag_val == "true" or bms_flag_val == 1:
+                    bms_status_str = "Connected"
+                elif bms_flag_val is False or bms_flag_val == "false" or bms_flag_val == 0:
+                    bms_status_str = "Disconnected"
+                else:
+                    bms_status_str = None
+
+            result = {
+                "type": DeviceTypeEnum.LITHIUM_BATTERY_PACK,
+                "serialNumber": device_sn,
+                "firmwareVersion": firmware_version,
+                "collectorSn": basic_info.get("collectorSn"),
+                "data": {
+                    "voltage": batt_volt if batt_volt is not None else 0.0,
+                    "current": batt_curr if batt_curr is not None else 0.0,
+                    "soc": batt_soc if batt_soc is not None else 0,
+                    "soh": batt_soh if batt_soh is not None else 0,
+                    "ratedEnergy": rated_energy_kwh,
+                    "energyUnit": str(snapshot.get("energyUnit", "")),
+                    "nameplateRatedPower": str(snapshot.get("nameplateRatedPower", "")),
+                    "power": _safe_float(snapshot.get("bmsPower")),
+                    "chargingState": charging_state,
+                    "tempMax": _safe_float(snapshot.get("tempMax")),
+                    "tempMin": _safe_float(snapshot.get("tempMin")),
+                    "remainingEnergy": remaining_energy,
+                    "capacity": batt_capacity if batt_capacity is not None else 0.0,
+                    "maxCellVoltage": max_cell_v,
+                    "minCellVoltage": min_cell_v,
+                    "maxCellVoltageNum": max_cell_num,
+                    "minCellVoltageNum": min_cell_num,
+                    "dvCells": dv_cells,
+                    **cell_voltages,
+                    "emsSocAvg": _safe_int(snapshot.get("emsSocAvg")),
+                    "wifiSignal": _safe_int(snapshot.get("wifiSignal")),
+                    "cellTemp1": _safe_float(snapshot.get("cellTemp1"), default=None),
+                    "cellTemp2": _safe_float(snapshot.get("cellTemp2"), default=None),
+                    "cellTemp3": _safe_float(snapshot.get("cellTemp3"), default=None),
+                    "cellTemp4": _safe_float(snapshot.get("cellTemp4"), default=None),
+                    "chargeLimitVoltage": _safe_float(snapshot.get("BMSLCVolt")),
+                    "dischargeLimitVoltage": _safe_float(snapshot.get("BMSLDVolt")),
+                    "chargeLimitCurrent": _safe_float(snapshot.get("BMSLCCurr"), default=None),
+                    "dischargeLimitCurrent": _safe_float(snapshot.get("BMSLDCurr"), default=None),
+                    "cellCount": cell_count,
+                    "maxCellTempNum": _safe_int(snapshot.get("maxCellTempNum"), default=None),
+                    "minCellTempNum": _safe_int(snapshot.get("minBattTempNum"), default=None),
+                    "batteryType": str(snapshot.get("batTyStr")) if snapshot.get("batTyStr") else None,
+                    "connectedInverterSn": str(snapshot.get("invSn")) if snapshot.get("invSn") else None,
+                    "bmsCommunicationStatus": bms_status_str,
+                    "warnCount": warn_count,
+                    "lastWarnMsg": last_warn_msg,
+                }
+            }
+        else:
+            raw_model = snapshot.get("deviceModel") or snapshot.get("model") or snapshot.get("productTypeEnum") or "Solar Inverter"
+            model_display = str(raw_model).replace("_", " ").title()
+            if "Felicity" not in model_display:
+                model_display = f"Felicity {model_display}"
+
+            # Handle rated power calculation (stored in kW)
+            raw_rated = _safe_float(snapshot.get("ratedPower") or snapshot.get("nameplateRatedPower") or snapshot.get("ratePower"))
+            if raw_rated > 100:
+                # If value is returned in Watts (e.g. 6000), convert to kW
+                raw_rated = raw_rated / 1000.0
+
+            # Fallback parsing from model name if API returned 0 / missing
+            if raw_rated == 0:
+                match = re.search(r"(\d+)\s*K", model_display.upper())
+                if match:
+                    raw_rated = float(match.group(1))
+
+            # Handle PV Power calculation (raw API or sum of dual/quad MPPT)
+            pv1_power = _safe_float(snapshot.get("pv1Power") if snapshot.get("pv1Power") is not None else snapshot.get("pvPower"))
+            pv2_power = _safe_float(snapshot.get("pv2Power") or snapshot.get("pvPower2"))
+            pv3_power = _safe_float(snapshot.get("pv3Power") or snapshot.get("pvPower3"))
+            pv4_power = _safe_float(snapshot.get("pv4Power") or snapshot.get("pvPower4"))
+            raw_pv_power = _safe_float(snapshot.get("pvPower"))
+            raw_pv_total_power = _safe_float(snapshot.get("pvTotalPower"))
+
+            total_pv_power = raw_pv_total_power if snapshot.get("pvTotalPower") is not None else raw_pv_power
+            if snapshot.get("pvTotalPower") is None and total_pv_power == 0 and (pv1_power > 0 or pv2_power > 0 or pv3_power > 0 or pv4_power > 0):
+                total_pv_power = pv1_power + pv2_power + pv3_power + pv4_power
+
+            # Battery charge / discharge powers calculation
+            ems_power = _safe_float(snapshot.get("emsPower"))
+            bms_state = _safe_int(snapshot.get("bmsChargingState"), -1)
+            if bms_state == 1:
+                battery_charging_power = abs(ems_power)
+                battery_discharging_power = 0.0
+            elif bms_state == 2:
+                battery_charging_power = 0.0
+                battery_discharging_power = abs(ems_power)
+            else:
+                battery_charging_power = ems_power if ems_power > 0 else 0.0
+                battery_discharging_power = abs(ems_power) if ems_power < 0 else 0.0
+
+            # BMS Communication Status
+            bms_flag_val = snapshot.get("bmsFlag")
+            if bms_flag_val is True or bms_flag_val == "true" or bms_flag_val == 1:
+                bms_status = "Connected"
+            elif bms_flag_val is False or bms_flag_val == "false" or bms_flag_val == 0:
+                bms_status = "Disconnected"
+            else:
+                bms_status = None
+
+            result = {
+                "type": DeviceTypeEnum.HIGH_FREQUENCY_INVERTER,
+                "productTypeEnum": device_type,
+                "modelName": model_display,
+                "serialNumber": device_sn,
+                "firmwareVersion": firmware_version,
+                "collectorSn": basic_info.get("collectorSn"),
+                "settings": settings,
+                "data": {
+                    "acInputVoltage": _safe_float(snapshot.get("acRInVolt")),
+                    "acInputFrequency": _safe_float(snapshot.get("acRInFreq")),
+                    "acInputPower": _safe_float(snapshot.get("acRInPower")),
+                    "acGridCurrentL1": _safe_float(snapshot.get("acRInCurr")),
+                    "acGridCurrentL2": _safe_float(snapshot.get("acSInCurr")),
+                    "acGridCurrentL3": _safe_float(snapshot.get("acTInCurr")),
+                    "acGridVoltageL2": _safe_float(snapshot.get("acSInVolt")),
+                    "acGridVoltageL3": _safe_float(snapshot.get("acTInVolt")),
+                    "acGridFrequencyL2": _safe_float(snapshot.get("acSInFreq")),
+                    "acGridFrequencyL3": _safe_float(snapshot.get("acTInFreq")),
+                    "acGridPowerL1": _safe_float(snapshot.get("acRInPower")),
+                    "acGridPowerL2": _safe_float(snapshot.get("acSInPower")),
+                    "acGridPowerL3": _safe_float(snapshot.get("acTInPower")),
+                    "acTotalGridPower": _safe_float(snapshot.get("acTtlInpower") if snapshot.get("acTtlInpower") is not None else snapshot.get("acRInPower")),
+                    "acOutputVoltage": _safe_float(snapshot.get("acROutVolt")),
+                    "acOutputCurrent": _safe_float(snapshot.get("acROutCurr")),
+                    "acOutputFrequency": _safe_float(snapshot.get("acROutFreq")),
+                    "acTotalOutputActivePower": _safe_float(snapshot.get("acTotalOutActPower")),
+                    "acTotalBackupApparentPower": _safe_float(snapshot.get("acTotalOutAppaPower")),
+                    "acBackupVoltageL2": _safe_float(snapshot.get("acSOutVolt")),
+                    "acBackupVoltageL3": _safe_float(snapshot.get("acTOutVolt")),
+                    "acBackupCurrentL1": _safe_float(snapshot.get("acROutCurr")),
+                    "acBackupCurrentL2": _safe_float(snapshot.get("acSOutCurr")),
+                    "acBackupCurrentL3": _safe_float(snapshot.get("acTOutCurr")),
+                    "acBackupPowerL1": _safe_float(snapshot.get("acROutPower")),
+                    "acBackupPowerL2": _safe_float(snapshot.get("acSOutPower")),
+                    "acBackupPowerL3": _safe_float(snapshot.get("acTOutPower")),
+                    "loadPercentage": _safe_float(snapshot.get("loadPercent")),
+                    "pvVoltage": _safe_float(snapshot.get("pvVolt")),
+                    "pvInputCurrent": _safe_float(snapshot.get("pvInCurr")),
+                    "pvPower": total_pv_power,
+                    "pvTotalPower": total_pv_power,
+                    "pv1Voltage": _safe_float(snapshot.get("pv1Volt") or snapshot.get("pvVolt1") or snapshot.get("pvVolt")),
+                    "pv1Current": _safe_float(snapshot.get("pv1InCurr") or snapshot.get("pvInCurr1") or snapshot.get("pvInCurr")),
+                    "pv1Power": pv1_power,
+                    "pv2Voltage": _safe_float(snapshot.get("pv2Volt") or snapshot.get("pvVolt2")),
+                    "pv2Current": _safe_float(snapshot.get("pv2InCurr") or snapshot.get("pvInCurr2")),
+                    "pv2Power": pv2_power,
+                    "pv3Voltage": _safe_float(snapshot.get("pv3Volt") or snapshot.get("pvVolt3")),
+                    "pv3Current": _safe_float(snapshot.get("pv3InCurr") or snapshot.get("pvInCurr3")),
+                    "pv3Power": pv3_power,
+                    "pv4Voltage": _safe_float(snapshot.get("pv4Volt") or snapshot.get("pvVolt4")),
+                    "pv4Current": _safe_float(snapshot.get("pv4InCurr") or snapshot.get("pvInCurr4")),
+                    "pv4Power": pv4_power,
+                    "ctPower": _safe_float(snapshot.get("ctPower")),
+                    "meterPower": _safe_float(snapshot.get("meterPower")),
+                    "totalConsumptionPower": _safe_float(snapshot.get("totalConsumPower")),
+                    "genPower": _safe_float(snapshot.get("genTotalPower") or snapshot.get("genPower")),
+                    "genVoltage": _safe_float(snapshot.get("genVoltage")),
+                    "genCurrent": _safe_float(snapshot.get("genCurrent")),
+                    "genFrequency": _safe_float(snapshot.get("genFrequency")),
+                    "batteryVoltage": _safe_float(snapshot.get("emsVoltage") or snapshot.get("battVolt")),
+                    "batteryCurrent": _safe_float(snapshot.get("emsCurrent") or snapshot.get("battCurr")),
+                    "batteryPower": ems_power,
+                    "batteryChargingPower": round(battery_charging_power, 2),
+                    "batteryDischargingPower": round(battery_discharging_power, 2),
+                    "batterySoc": _safe_int(snapshot.get("emsSoc") if snapshot.get("emsSoc") is not None else snapshot.get("battSoc")),
+                    "bmsCommunicationStatus": bms_status,
+                    "battery2Voltage": _safe_float(snapshot.get("emsVoltage2")),
+                    "battery2Current": _safe_float(snapshot.get("emsCurrent2")),
+                    "battery2Power": _safe_float(snapshot.get("emsPower2")),
+                    "battery2Soc": _safe_int(snapshot.get("emsSoc2")),
+                    "tempMax": _safe_float(snapshot.get("tempMax")),
+                    "devTempMax": _safe_float(snapshot.get("devTempMax")),
+                    "devTempMin": _safe_float(snapshot.get("devTempMin")),
+                    "energyPvToday": _safe_float(snapshot.get("ePvToday") or snapshot.get("epvToday")),
+                    "energyPvTotal": _safe_float(snapshot.get("ePvTotal")),
+                    "energyPvMonth": _safe_float(snapshot.get("ePvMonth")),
+                    "energyPvYear": _safe_float(snapshot.get("ePvYear")),
+                    "energyLoadToday": _safe_float(snapshot.get("eLoadToday")),
+                    "energyLoadTotal": _safe_float(snapshot.get("eLoadTotal")),
+                    "energyLoadMonth": _safe_float(snapshot.get("eLoadMonth")),
+                    "energyLoadYear": _safe_float(snapshot.get("eLoadYear")),
+                    "energyGridFeedToday": _safe_float(snapshot.get("eGridFeedToday") or snapshot.get("egridFeedToday")),
+                    "energyGridFeedTotal": _safe_float(snapshot.get("eGridFeedTotal") or snapshot.get("egridFeedTotal")),
+                    "energyGridFeedMonth": _safe_float(snapshot.get("eGridFeedMonth") or snapshot.get("egridFeedMonth")),
+                    "energyGridFeedYear": _safe_float(snapshot.get("eGridFeedYear") or snapshot.get("egridFeedYear")),
+                    "energyGridImportToday": _safe_float(snapshot.get("eToday") or snapshot.get("etoday")),
+                    "energyGridImportTotal": _safe_float(snapshot.get("eTotal") or snapshot.get("etotal")),
+                    "energyGridImportMonth": _safe_float(snapshot.get("eMonth") or snapshot.get("emonth")),
+                    "energyGridImportYear": _safe_float(snapshot.get("eYear") or snapshot.get("eyear")),
+                    "energyBatteryChargeToday": _safe_float(
+                        snapshot.get("eBatCharToday") or snapshot.get("ebatCharToday") or snapshot.get("bat1CharToday")
+                    ),
+                    "energyBatteryChargeMonth": _safe_float(
+                        snapshot.get("eBatCharMonth") or snapshot.get("ebatCharMonth") or snapshot.get("bat1CharMonth")
+                    ),
+                    "energyBatteryChargeYear": _safe_float(
+                        snapshot.get("eBatCharYear") or snapshot.get("ebatCharYear") or snapshot.get("bat1CharYear")
+                    ),
+                    "energyBatteryChargeTotal": _safe_float(
+                        snapshot.get("eBatCharTotal") or snapshot.get("ebatCharTotal") or snapshot.get("bat1CharTotal")
+                    ),
+                    "energyBatteryDischargeToday": _safe_float(
+                        snapshot.get("eBatDisCharToday") or snapshot.get("ebatDischarToday") or snapshot.get("ebatDisCharToday") or snapshot.get("bat1DisCharToday")
+                    ),
+                    "energyBatteryDischargeMonth": _safe_float(
+                        snapshot.get("eBatDisCharMonth") or snapshot.get("ebatDischarMonth") or snapshot.get("ebatDisCharMonth") or snapshot.get("bat1DisCharMonth")
+                    ),
+                    "energyBatteryDischargeYear": _safe_float(
+                        snapshot.get("eBatDisCharYear") or snapshot.get("ebatDischarYear") or snapshot.get("ebatDisCharYear") or snapshot.get("bat1DisCharYear")
+                    ),
+                    "energyBatteryDischargeTotal": _safe_float(
+                        snapshot.get("eBatDisCharTotal") or snapshot.get("ebatDischarTotal") or snapshot.get("ebatDisCharTotal") or snapshot.get("bat1DisCharTotal")
+                    ),
+                    "totalEnergy": _safe_float(snapshot.get("totalEnergy")),
+                    "smartLoadPower": _safe_float(snapshot.get("smartTotalPower") or snapshot.get("smartLoadPower")),
+                    "smartLoadVoltage": _safe_float(snapshot.get("smartLoadVolt")),
+                    "smartLoadCurrent": _safe_float(snapshot.get("smartLoadCurr")),
+                    "smartLoadFrequency": _safe_float(snapshot.get("smartLoadFreq")),
+                    "smartLoadEnergyToday": _safe_float(snapshot.get("smartLoadToday")),
+                    "smartLoadEnergyTotal": _safe_float(snapshot.get("smartLoadTotal")),
+                    "energyGenToday": _safe_float(snapshot.get("genToday")),
+                    "energyGenTotal": _safe_float(snapshot.get("genTotal")),
+                    "genPowerL2": _safe_float(snapshot.get("genPower2")),
+                    "genPowerL3": _safe_float(snapshot.get("genPower3")),
+                    "meterLinkStatus": str(snapshot.get("electricityMeterLinkStr")) if snapshot.get("electricityMeterLinkStr") else None,
+                    "totalEmsCapacity": _safe_float(snapshot.get("totalEmsCapacity")),
+                    "workModeStr": snapshot.get("workModeStr") or snapshot.get("operMStr"),
+                    "ratedPower": raw_rated,
+                    "workMode": WORK_MODE_MAP.get(
+                        _safe_int(snapshot.get("workMode") if snapshot.get("workMode") is not None else snapshot.get("workModel"), -1),
+                        "Unknown"
+                    ),
+                    "warnCount": warn_count,
+                    "lastWarnMsg": last_warn_msg,
+                }
+            }
+
+        return result

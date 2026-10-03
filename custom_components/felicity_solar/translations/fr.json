@@ -30,10 +30,10 @@
   "options": {
     "step": {
       "init": {
-        "title": "Options Felicity Solar",
-        "description": "Configurez l'intervalle d'actualisation de la télémétrie.",
+        "title": "Felicity Solar WebSocket",
+        "description": "Configurez la cadence des lectures WebSocket. Les mesures ne sont jamais lues par HTTP.",
         "data": {
-          "update_interval": "Intervalle d'actualisation (secondes)"
+          "realtime_interval": "Intervalle WebSocket (secondes)"
         }
       }
     }
