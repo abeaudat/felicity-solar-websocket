@@ -71,6 +71,26 @@ async def test_partial_frames_preserve_energy_and_true_zero_soc(coordinator):
     assert coordinator.data['inverter']['settings'] == {'workMode': 3}
 
 
+async def test_live_lowercase_energy_counters_and_missing_totals(coordinator):
+    message = frame()
+    message['deviceSnapshot'].update(eloadToday='22.6', eloadTotal='179.4',
+                                     eloadMonth='72.1', eloadYear='179.3',
+                                     epvMonth='95.2', epvYear='224.1')
+    coordinator._on_frame('inverter', message)
+    values = coordinator.data['inverter']['data']
+    assert values['energyLoadToday'] == 22.6
+    assert values['energyLoadTotal'] == 179.4
+    assert values['energyLoadMonth'] == 72.1
+    assert values['energyLoadYear'] == 179.3
+    assert values['energyPvMonth'] == 95.2
+    assert values['energyPvYear'] == 224.1
+    assert values['energyPvTotal'] is None  # Missing counter must not reset to zero.
+
+    coordinator._on_frame('inverter', {'deviceSn': 'inverter',
+                                      'deviceSnapshot': {'eloadToday': '0'}})
+    assert coordinator.data['inverter']['data']['energyLoadToday'] == 0
+
+
 async def test_no_http_snapshot_api_or_polling(coordinator):
     assert not hasattr(FelicitySolarAPI, 'get_device_snapshot')
     assert not hasattr(FelicitySolarAPI, 'API_URL_DEVICE_SNAPSHOT')

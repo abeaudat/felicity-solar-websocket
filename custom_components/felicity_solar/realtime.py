@@ -41,6 +41,14 @@ def normalize_snapshot(frame: dict, previous_scale: float = 1.0) -> tuple[dict, 
     ratio; remember the last confirmed scale when all reference powers are zero.
     """
     snapshot = dict(frame["deviceSnapshot"])
+    # The live protocol uses lower-case energy prefixes (eloadToday, epvMonth),
+    # while older snapshots used eLoadToday / ePvMonth. Keep entity keys stable.
+    live_keys = {key.casefold(): key for key in snapshot}
+    for prefix in ("ePv", "eLoad", "eGridFeed", "eBatChar", "eBatDisChar"):
+        for period in ("Today", "Month", "Year", "Total"):
+            canonical = prefix + period
+            if canonical not in snapshot and (source := live_keys.get(canonical.casefold())):
+                snapshot[canonical] = snapshot[source]
     scale = previous_scale
     unit = str(snapshot.get("powerUnit", "")).strip().lower()
     if unit in ("kw", "kva"):
@@ -67,7 +75,7 @@ def normalize_snapshot(frame: dict, previous_scale: float = 1.0) -> tuple[dict, 
             snapshot[key] = None
     # The envelope gives authoritative W totals, including true zero values.
     for key in ("pvTotalPower", "emsPower", "acTotalOutActPower", "meterPower",
-                "genPower", "totalConsumPower"):
+                "genPower", "totalConsumPower", "ctPower"):
         value = _number(frame.get(key))
         if value is not None:
             snapshot[key] = value

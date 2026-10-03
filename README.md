@@ -4,7 +4,7 @@ Home Assistant custom integration for Felicity Solar / FSolar, forked from
 [Smilebob Edition](https://github.com/smilebob/felicity_solar_hacs), itself based
 on [Matheus Trindade's integration](https://github.com/matheustavarestrindade/felicity_solar_hacs).
 
-Version **2.0.0** replaces HTTP telemetry snapshots with the same WebSocket read
+Version **2.0.1** replaces HTTP telemetry snapshots with the same WebSocket read
 protocol used by the FSolar web portal's **Real-time Data** button. The default
 read interval is **5 seconds**, adjustable between 2 and 60 seconds.
 
@@ -86,8 +86,12 @@ python3.14 -m venv .venv
 The production WebSocket client was also tested against an IVGM15KLP3G1 on
 2026-10-03 with TLS verification enabled and a 5-second read interval. This was
 a short telemetry test, not a continuous-operation or physical-control test.
-The separate battery protocol is covered by fixtures; hardware compatibility
-with every battery/logger is not claimed.
+The separate battery protocol is covered by fixtures. The FLA48300TG2 tested
+on this installation did not answer its own energy-flow WebSocket, including
+when tested without the inverter connection; its BMS entities therefore remain
+unavailable in WebSocket-only mode. Missing lifetime energy counters are reported
+as unknown rather than zero. Hardware compatibility with every battery/logger
+is not claimed.
 
 ## Credits and license
 
