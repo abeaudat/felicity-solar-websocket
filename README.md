@@ -4,7 +4,7 @@ Home Assistant custom integration for Felicity Solar / FSolar, forked from
 [Smilebob Edition](https://github.com/smilebob/felicity_solar_hacs), itself based
 on [Matheus Trindade's integration](https://github.com/matheustavarestrindade/felicity_solar_hacs).
 
-Version **2.0.3** replaces HTTP telemetry snapshots with the same WebSocket read
+Version **2.0.4** replaces HTTP telemetry snapshots with the same WebSocket read
 protocol used by the FSolar web portal's **Real-time Data** button. The default
 read interval is **5 seconds**, adjustable between 2 and 60 seconds.
 
@@ -16,8 +16,12 @@ read interval is **5 seconds**, adjustable between 2 and 60 seconds.
   collector serial numbers. It sends no inverter setting changes automatically.
 - Updates the existing Home Assistant entities from `deviceSnapshot` messages.
 - Normalizes inverter snapshot powers to W; the live envelope is already in W.
-- Waits for each response before sending another read, respects the configured
-  interval, and reconnects with backoff capped at 60 seconds.
+- Waits for each response before the next scheduled read. If a response is
+  missing, retries the read on the same connection after 10 seconds (or the
+  configured interval, if longer), as the FSolar portal does. Retries do not
+  extend the 20-second response deadline. Reconnect backoff is capped at 60 seconds.
+- Answers server WebSocket pings without sending additional heartbeat pings,
+  matching browser behavior; the telemetry deadline still detects silent streams.
 - Marks a device's sensors unavailable when the connection fails or its read
   times out (20 seconds). Last values are retained for diagnosis but are not
   presented as available telemetry.
@@ -77,7 +81,8 @@ your dashboards or templates automatically.
 ## Validation
 
 Tests run against the real Home Assistant 2026.9.4 framework, with local aiohttp
-WebSocket servers exercising receive pacing, device isolation, timeout,
+WebSocket servers exercising receive pacing, lost-response recovery on the same
+connection, invalid-frame flooding, device isolation, timeout,
 reconnect, cancellation, unit normalization, retained partial fields, sensor
 availability, entity IDs and the options flow. HTTP account discovery is tested
 separately; no real credentials are used by CI.
@@ -93,6 +98,11 @@ python3.14 -m venv .venv
 The following installation was tested on **2026-10-03**, running integration
 **2.0.3** on **Home Assistant 2026.9.4**. The 26 automated tests also pass against
 the real Home Assistant 2026.9.4 framework on Python 3.14.
+
+Connection recovery was retested with the same installation on **2026-10-04**
+using **2.0.4**. The updated suite contains **28 passing tests**, including a
+lost response recovered on the existing socket and stale detection during a
+continuous stream of unrelated frames.
 
 | Device | Model | Rating reported by FSolar | Telemetry verified in Home Assistant |
 | --- | --- | --- | --- |

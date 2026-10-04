@@ -140,3 +140,73 @@ async def test_stop_cancels_waiting_reader_without_leaking_task():
         await asyncio.wait_for(client.stop(), .5)
         assert task.done()
         assert client._task is None
+
+
+async def test_lost_read_response_recovers_on_same_socket_without_unavailability():
+    connections, requests, frames, statuses = [], [], [], []
+    recovered = asyncio.Event()
+    async def handler(request):
+        socket = web.WebSocketResponse()
+        await socket.prepare(request)
+        connections.append(socket)
+        async for message in socket:
+            requests.append(asyncio.get_running_loop().time())
+            if len(requests) == 2:
+                # The collector/server drops one reply while the transport lives.
+                continue
+            await socket.send_json(frame())
+        return socket
+    def on_frame(value):
+        frames.append(value)
+        if len(frames) >= 2:
+            recovered.set()
+    async with server(handler) as url, aiohttp.ClientSession() as session:
+        client = FelicityRealtimeClient(session, 'inverter', 'logger', on_frame,
+                                       statuses.append, interval=.02,
+                                       response_timeout=.12, url=url)
+        client.start()
+        try:
+            await asyncio.wait_for(recovered.wait(), .5)
+            assert len(connections) == 1
+            assert False not in statuses
+            assert requests[2] - requests[1] >= .05
+        finally:
+            await client.stop()
+
+
+async def test_continuous_invalid_frames_do_not_prevent_retry_or_stale_timeout():
+    connections, requests, statuses = [], [], []
+    async def handler(request):
+        socket = web.WebSocketResponse()
+        await socket.prepare(request)
+        connections.append(socket)
+        async def noise():
+            while not socket.closed:
+                await socket.send_json(frame('other-device'))
+                await asyncio.sleep(.005)
+        task = asyncio.create_task(noise()) if len(connections) == 1 else None
+        try:
+            async for message in socket:
+                requests.append((len(connections), asyncio.get_running_loop().time()))
+                if len(connections) > 1:
+                    await socket.send_json(frame())
+        finally:
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        return socket
+    async with server(handler) as url, aiohttp.ClientSession() as session:
+        client = FelicityRealtimeClient(session, 'inverter', 'logger', lambda _: None,
+                                       statuses.append, interval=.02,
+                                       response_timeout=.08, url=url)
+        client._backoff = .01
+        client.start()
+        try:
+            await asyncio.wait_for(client.first_frame.wait(), .5)
+            first_reads = [t for connection, t in requests if connection == 1]
+            assert len(first_reads) == 2
+            assert first_reads[1] - first_reads[0] >= .03
+            assert statuses[0] is False
+            assert True in statuses
+        finally:
+            await client.stop()

@@ -88,8 +88,8 @@ def normalize_snapshot(frame: dict, previous_scale: float = 1.0) -> tuple[dict, 
 class FelicityRealtimeClient:
     """One bounded request/response stream per account-owned device.
 
-    A new read is sent only after the previous response, at most once per
-    configured interval. Silence closes the stream and causes reconnect.
+    Reads are paced by the configured interval. A missing response is retried
+    on the same socket, without extending the telemetry freshness deadline.
     """
 
     def __init__(self, session: aiohttp.ClientSession, device_sn: str,
@@ -122,9 +122,21 @@ class FelicityRealtimeClient:
     async def _receive_frame(self, socket) -> dict:
         # Ignore acknowledgements, malformed frames, and frames for another
         # device without extending the timeout or changing sensor freshness.
+        loop = asyncio.get_running_loop()
+        # FSolar's portal retries a stalled read after about ten seconds.
+        # Keep retries no faster than the configured read interval.
+        retry_interval = max(self.interval, min(10, self.response_timeout / 2))
+        next_retry = loop.time() + retry_interval
         async with asyncio.timeout(self.response_timeout):
             while True:
-                message = await socket.receive()
+                try:
+                    message = await asyncio.wait_for(
+                        socket.receive(), max(0, next_retry - loop.time()))
+                except TimeoutError:
+                    _LOGGER.debug("FSolar telemetry response delayed; retrying read on current socket")
+                    await self._send_read(socket)
+                    next_retry = loop.time() + retry_interval
+                    continue
                 if message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE,
                                     aiohttp.WSMsgType.ERROR):
                     raise ConnectionError("FSolar telemetry stream closed")
@@ -140,19 +152,24 @@ class FelicityRealtimeClient:
                         and frame["deviceSnapshot"]):
                     return frame
 
+    async def _send_read(self, socket) -> None:
+        await socket.send_json({
+            "type": "command",
+            "deviceCommand": {"deviceSn": self.device_sn,
+                              "collectorSn": self.collector_sn},
+        })
+
     async def _run_connected(self) -> None:
         # This is the vendor portal's read command, not a settings command.
         async with self.session.ws_connect(
-            self.url, heartbeat=15, max_msg_size=1024 * 1024,
+            # Mirror the browser: answer server pings, but use the bounded
+            # telemetry deadline rather than requiring unsolicited pong replies.
+            self.url, heartbeat=None, autoping=True, max_msg_size=1024 * 1024,
         ) as socket:
             loop = asyncio.get_running_loop()
             while True:
                 requested_at = loop.time()
-                await socket.send_json({
-                    "type": "command",
-                    "deviceCommand": {"deviceSn": self.device_sn,
-                                      "collectorSn": self.collector_sn},
-                })
+                await self._send_read(socket)
                 frame = await self._receive_frame(socket)
                 self.on_frame(frame)
                 self.last_received = datetime.now(timezone.utc)
