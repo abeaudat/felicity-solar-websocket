@@ -97,6 +97,37 @@ async def test_stream_ignores_other_devices_and_paces_read_commands():
         assert not session.closed  # Caller owns the session.
 
 
+async def test_push_frames_are_consumed_while_read_commands_are_paced():
+    """FSolar can push several frames between our five-second reads."""
+    requests, frames = [], []
+    caught_up = asyncio.Event()
+
+    async def handler(request):
+        socket = web.WebSocketResponse()
+        await socket.prepare(request)
+        async for message in socket:
+            requests.append(message.json())
+            for sequence in range(3):
+                await socket.send_json({**frame(), 'sequence': sequence})
+        return socket
+
+    def on_frame(value):
+        frames.append(value)
+        if value['sequence'] == 2:
+            caught_up.set()
+
+    async with server(handler) as url, aiohttp.ClientSession() as session:
+        client = FelicityRealtimeClient(session, 'inverter', 'logger', on_frame,
+                                       lambda _: None, interval=.3, url=url)
+        client.start()
+        try:
+            await asyncio.wait_for(caught_up.wait(), .15)
+            assert [item['sequence'] for item in frames] == [0, 1, 2]
+            assert len(requests) == 1  # Reading the backlog must not send extra commands.
+        finally:
+            await client.stop()
+
+
 async def test_silence_invalidates_freshness_and_reconnect_recovers():
     connections, statuses, frames = [], [], []
     async def handler(request):

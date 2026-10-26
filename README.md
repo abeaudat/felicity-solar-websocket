@@ -4,9 +4,10 @@ Home Assistant custom integration for Felicity Solar / FSolar, forked from
 [Smilebob Edition](https://github.com/smilebob/felicity_solar_hacs), itself based
 on [Matheus Trindade's integration](https://github.com/matheustavarestrindade/felicity_solar_hacs).
 
-Version **2.0.4** replaces HTTP telemetry snapshots with the same WebSocket read
-protocol used by the FSolar web portal's **Real-time Data** button. The default
-read interval is **5 seconds**, adjustable between 2 and 60 seconds.
+Version **2.0.5** uses the same WebSocket read protocol as the FSolar web portal's
+**Real-time Data** button for inverter telemetry. Incoming messages are consumed
+continuously, independently from the default **5-second** command interval
+(adjustable between 2 and 60 seconds). See the [changelog](CHANGELOG.md).
 
 ## How it works
 
@@ -16,10 +17,13 @@ read interval is **5 seconds**, adjustable between 2 and 60 seconds.
   collector serial numbers. It sends no inverter setting changes automatically.
 - Updates the existing Home Assistant entities from `deviceSnapshot` messages.
 - Normalizes inverter snapshot powers to W; the live envelope is already in W.
-- Waits for each response before the next scheduled read. If a response is
-  missing, retries the read on the same connection after 10 seconds (or the
-  configured interval, if longer), as the FSolar portal does. Retries do not
-  extend the 20-second response deadline. Reconnect backoff is capped at 60 seconds.
+- Consumes every valid incoming frame immediately, including additional pushes
+  between scheduled commands. Receiving messages never waits for the command
+  interval, so older frames cannot accumulate behind the read schedule.
+- Paces commands separately. If a response is missing, retries on the same
+  connection after 10 seconds (or the configured interval, if longer), as the
+  FSolar portal does. Retries and invalid frames do not extend the 20-second
+  valid-telemetry deadline. Reconnect backoff is capped at 60 seconds.
 - Answers server WebSocket pings without sending additional heartbeat pings,
   matching browser behavior; the telemetry deadline still detects silent streams.
 - Marks a device's sensors unavailable when the connection fails or its read
@@ -81,7 +85,8 @@ your dashboards or templates automatically.
 ## Validation
 
 Tests run against the real Home Assistant 2026.9.4 framework, with local aiohttp
-WebSocket servers exercising receive pacing, lost-response recovery on the same
+WebSocket servers exercising command pacing, continuous reception of pushed
+frames, lost-response recovery on the same
 connection, invalid-frame flooding, device isolation, timeout,
 reconnect, cancellation, unit normalization, retained partial fields, sensor
 availability, entity IDs and the options flow. HTTP account discovery is tested
@@ -103,6 +108,21 @@ Connection recovery was retested with the same installation on **2026-10-04**
 using **2.0.4**. The updated suite contains **28 passing tests**, including a
 lost response recovered on the existing socket and stale detection during a
 continuous stream of unrelated frames.
+
+The continuous-reception fix was deployed and checked on **2026-10-21** with
+**Home Assistant 2026.10.2**, before its publication as **2.0.5**. During an
+approximately three-minute comparison, all 86 Home Assistant samples agreed
+with FSolar on battery SOC and daily energy counters, with no unavailable
+samples or growing delay. This is a bounded live check, not an endurance test.
+
+The repository audit on **2026-10-26** compared every installed component file
+with the published 2.0.4 source and the local working tree. The only unpublished
+runtime change was `realtime.py`; its regression test is included in 2.0.5.
+The October 7 outage investigation added diagnostic logging and local capture
+helpers, without another integration-code patch. See
+[troubleshooting](docs/troubleshooting.md) for the reusable diagnostic procedure.
+The complete **29-test** suite passes against the real Home Assistant 2026.9.4
+framework on Python 3.14, including the pushed-frame regression test.
 
 | Device | Model | Rating reported by FSolar | Telemetry verified in Home Assistant |
 | --- | --- | --- | --- |

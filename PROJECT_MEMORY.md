@@ -1,11 +1,11 @@
 # 🧠 Global Project Memory: Felicity Solar (Smilebob Edition)
 
-> **Last Updated**: 2026-09-09 | **Status**: Active / Production (Dynamic Model Support, Battery Sensors & Rated Power OK)
+> **Last Updated**: 2026-10-26 | **Status**: WebSocket fork, version 2.0.5
 
 ## 🎯 Overview & Goal
 - **Description**: Custom Home Assistant component (HACS) to monitor Felicity Solar equipment (T-REX-6KLP1G01 hybrid inverters with dual MPPT, HF/LF inverters, and Lithium Battery Packs) with dynamic model identification and Rated Power sensor support.
-- **GitHub Repository**: `https://github.com/smilebob/felicity_solar_hacs`
-- **Tech Stack**: Home Assistant Core, Python 3.12+, `aiohttp`, `PyCryptodome`, `PyJWT`
+- **GitHub Repository**: `https://github.com/abeaudat/felicity-solar-websocket`, forked from Smilebob Edition.
+- **Tech Stack**: Home Assistant Core 2026.9.4+, Python 3.14, `aiohttp`, `PyCryptodome`, `PyJWT`
 - **Global Entry Point**: `custom_components/felicity_solar/__init__.py`
 
 ---
@@ -14,18 +14,32 @@
 | Action | Command | Note |
 | :--- | :--- | :--- |
 | **Syntax Verification** | `python3 -m py_compile custom_components/felicity_solar/*.py` | Standalone validation |
-| **Git Push** | `git push origin main` | Automatic HACS deployment |
+| **Git Push** | `git push origin main` | Publishes source only; HACS also needs a tagged release and `felicity_solar.zip` |
 
 ---
 
 ## 🗺️ Component Index (Mapping)
 | Directory / Module | Role & Responsibility | Detailed Documentation |
 | :--- | :--- | :--- |
-| `custom_components/felicity_solar/` | Home Assistant integration component (API, Coordinator, Sensors, ConfigFlow) | [MEMORY.md](file:///home/pierre/Projets/felicity_solar_hacs/custom_components/felicity_solar/MEMORY.md) |
+| `custom_components/felicity_solar/` | Home Assistant integration component (API, Coordinator, Sensors, ConfigFlow) | [MEMORY.md](custom_components/felicity_solar/MEMORY.md) |
 
 ---
 
-## 📌 Current State & Features Implemented
+## Current fork architecture
+
+- Inverter telemetry uses FSolar's energy-flow WebSocket. A continuous receiver
+  consumes pushes independently of the paced read commands (5 seconds by default).
+- Separate batteries use authenticated HTTP snapshots every 300 seconds by default.
+- TLS verification is enabled. There is no inverter HTTP telemetry fallback.
+- The existing `felicity_solar` domain, account entry, entity IDs and history are preserved.
+- See [README.md](README.md), [CHANGELOG.md](CHANGELOG.md) and
+  [troubleshooting](docs/troubleshooting.md) for current behavior and validation.
+
+## 📌 Inherited features and upstream implementation history
+
+The phase notes below describe the upstream implementation before the WebSocket
+fork. Their historical polling intervals and version numbers are not the current
+transport configuration.
 ### ✅ Implemented & Verified
 - [x] **Phase 1 OpenAPI Hardening Complete**: Refresh token support (`/openApi/sec/refreshToken`), granular API error codes, hardware firmware version (`sw_version`).
 - [x] **Phase 2 Advanced Telemetry Complete**:
@@ -68,9 +82,9 @@
 ---
 
 ## ⚠️ Technical Gotchas
-- **SSL Certificate Chain**: Felicity Solar servers omit intermediate CAs; all sessions use `create_felicity_client_session()` with SSL verification disabled for Felicity domains only.
+- **TLS**: `create_felicity_client_session()` uses normal certificate verification. Do not restore the upstream verification bypass.
 - **Dynamic Device Model**: `modelName` is dynamically parsed from `deviceModel`, `model` or `productTypeEnum`.
 - **HA Energy Rules**: To appear in the HA Energy Dashboard power dropdown, an entity MUST have both `device_class: power` AND `state_class: measurement`.
 - **Remote Setting Targets**: All remote parameter controls and custom services target inverter serial numbers, not standalone battery pack serial numbers. Control entities are instantiated only when settings are permitted and available.
 - **OpenAPI Permission 2001528**: Standard end-user accounts lack OpenAPI access; unpermitted queries are automatically silenced after one notification to avoid log spam.
-- **Update Interval**: Default is 120s with immediate query upon integration boot; configurable via Home Assistant Options Flow.
+- **Update Interval**: Inverter read commands default to 5 seconds (configurable 2–60 seconds); incoming frames are always consumed continuously. Separate battery HTTP snapshots use 300 seconds.
